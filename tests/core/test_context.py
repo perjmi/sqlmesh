@@ -2596,6 +2596,13 @@ def test_shadow_planner_persists_complete_model_graph(tmp_path):
     assert context.model_graph_index.fingerprint(model_b.fqn) == context.snapshots[
         model_b.fqn
     ].fingerprint
+    eager_diff = context._context_diff("dev", snapshots=context.snapshots)
+    assert context.compact_context_diff is not None
+    assert context.compact_context_diff.added == {
+        snapshot_id
+        for snapshot_id in eager_diff.added
+        if context.model_graph_index.contains(snapshot_id.name)
+    }
 
 
 def test_eager_planner_does_not_create_model_graph_index(tmp_path):

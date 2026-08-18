@@ -67,6 +67,7 @@ from sqlmesh.core.config.planner import PlannerMode
 from sqlmesh.core.config.root import RegexKeyDict
 from sqlmesh.core.console import get_console
 from sqlmesh.core.context_diff import ContextDiff
+from sqlmesh.core.context_diff_streaming import CompactContextDiff
 from sqlmesh.core.dialect import (
     format_model_expressions,
     is_meta_expression,
@@ -429,6 +430,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._selector_cls = selector or NativeSelector
         self._model_graph_index: t.Optional[ProjectGraphIndex] = None
         self._indexed_model_registry: t.Optional[IndexedModelRegistry] = None
+        self._compact_context_diff: t.Optional[CompactContextDiff] = None
 
         self.path, self.config = t.cast(t.Tuple[Path, C], next(iter(self.configs.items())))
 
@@ -1113,6 +1115,11 @@ class GenericContext(BaseContext, t.Generic[C]):
     def indexed_model_registry(self) -> t.Optional[IndexedModelRegistry]:
         """Returns the bounded, on-demand model registry when indexing is enabled."""
         return self._indexed_model_registry
+
+    @property
+    def compact_context_diff(self) -> t.Optional[CompactContextDiff]:
+        """Returns the most recent payload-free shadow context diff, if one was built."""
+        return self._compact_context_diff
 
     def _refresh_model_graph_index(self) -> None:
         if self.config.planner.mode == PlannerMode.EAGER:
@@ -3056,9 +3063,10 @@ class GenericContext(BaseContext, t.Generic[C]):
         if force_no_diff:
             return ContextDiff.create_no_diff(environment, self.state_reader)
 
-        return ContextDiff.create(
+        local_snapshots = snapshots or self.snapshots
+        context_diff = ContextDiff.create(
             environment,
-            snapshots=snapshots or self.snapshots,
+            snapshots=local_snapshots,
             create_from=create_from or c.PROD,
             state_reader=self.state_reader,
             provided_requirements=self._requirements,
@@ -3070,6 +3078,57 @@ class GenericContext(BaseContext, t.Generic[C]):
             infer_python_dependencies=self.config.infer_python_dependencies,
             always_recreate_environment=always_recreate_environment,
         )
+        if self.config.planner.mode == PlannerMode.SHADOW and self._model_graph_index is not None:
+            existing_environment = self.state_reader.get_environment(environment)
+            recreate_environment = always_recreate_environment and environment != (create_from or c.PROD)
+            if (
+                existing_environment is None
+                or existing_environment.expired
+                or recreate_environment
+            ):
+                comparison_environment = self.state_reader.get_environment(create_from or c.PROD)
+            else:
+                comparison_environment = existing_environment
+
+            environment_snapshots = ()
+            if comparison_environment is not None:
+                environment_snapshots = (
+                    comparison_environment.finalized_or_current_snapshots
+                    if ensure_finalized_snapshots
+                    else comparison_environment.snapshots
+                )
+            compact_diff = CompactContextDiff.create(
+                self._model_graph_index,
+                environment_snapshots,
+                local_snapshot_ids={
+                    name: snapshot.snapshot_id
+                    for name, snapshot in local_snapshots.items()
+                    if self._model_graph_index.contains(name)
+                },
+            )
+            indexed_names = set(self._model_graph_index.iter_names())
+            eager_added = {
+                snapshot_id for snapshot_id in context_diff.added if snapshot_id.name in indexed_names
+            }
+            eager_removed = {
+                snapshot_id
+                for snapshot_id in context_diff.removed_snapshots
+                if snapshot_id.name in indexed_names
+                or context_diff.removed_snapshots[snapshot_id].is_model
+            }
+            eager_modified = {
+                name for name in context_diff.modified_snapshots if name in indexed_names
+            }
+            if (
+                compact_diff.added != eager_added
+                or set(compact_diff.removed) != eager_removed
+                or set(compact_diff.modified) != eager_modified
+            ):
+                raise SQLMeshError(
+                    "The compact context diff does not match the eager context diff"
+                )
+            self._compact_context_diff = compact_diff
+        return context_diff
 
     def _destroy(self) -> bool:
         # Invalidate all environments, including prod

@@ -10,6 +10,8 @@ from sqlmesh.core.model.registry import IndexedModelRegistry, ModelMetadata, Mod
 from sqlmesh.core.selector import MetadataSelector
 from sqlmesh.core.snapshot.definition import fingerprint_from_node
 from sqlmesh.core.snapshot.streaming import StreamingFingerprinter
+from sqlmesh.core.context_diff_streaming import CompactContextDiff
+from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory
 from sqlmesh.utils.errors import SQLMeshError
 
 
@@ -168,3 +170,47 @@ def test_topological_batches_reject_cycles(tmp_path):
 
     with pytest.raises(SQLMeshError, match="cycle"):
         list(index.iter_topological_batches(batch_size=1))
+
+
+def test_compact_context_diff_matches_fingerprints_without_snapshot_payloads(tmp_path):
+    local_models = {
+        name: create_sql_model(name, parse_one(query))
+        for name, query in {
+            "a": "SELECT 1 AS id",
+            "b": "SELECT 2 AS id",
+            "c": "SELECT 3 AS id",
+        }.items()
+    }
+    index = ProjectGraphIndex(tmp_path / "graph.sqlite")
+    index.replace(ModelMetadata.from_model(model) for model in local_models.values())
+    index.put_fingerprints(
+        (
+            model.fqn,
+            fingerprint_from_node(model, nodes=local_models),
+        )
+        for name, model in local_models.items()
+    )
+
+    remote_a = Snapshot.from_node(local_models["a"], nodes=local_models)
+    remote_b_model = create_sql_model("b", parse_one("SELECT 200 AS id"))
+    remote_b = Snapshot.from_node(remote_b_model, nodes={"b": remote_b_model})
+    remote_d_model = create_sql_model("d", parse_one("SELECT 4 AS id"))
+    remote_d = Snapshot.from_node(remote_d_model, nodes={"d": remote_d_model})
+    for snapshot in (remote_a, remote_b, remote_d):
+        snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    compact = CompactContextDiff.create(
+        index, [remote_a.table_info, remote_b.table_info, remote_d.table_info]
+    )
+
+    assert {snapshot_id.name for snapshot_id in compact.added} == {'"c"'}
+    assert {snapshot_id.name for snapshot_id in compact.removed} == {'"d"'}
+    assert set(compact.modified) == {'"b"'}
+    assert set(compact.unchanged) == {'"a"'}
+
+    selected = CompactContextDiff.create(
+        index,
+        [],
+        local_snapshot_ids={remote_a.name: remote_a.snapshot_id},
+    )
+    assert selected.added == {remote_a.snapshot_id}
