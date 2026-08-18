@@ -179,6 +179,7 @@ class Loader(abc.ABC):
         self.config_path = path
         self.config = self.context.configs[self.config_path]
         self._variables_by_gateway: t.Dict[str, t.Dict[str, t.Any]] = {}
+        self._model_batch_consumer: t.Optional[t.Callable[[t.Tuple[Model, ...]], None]] = None
         self._console = get_console()
 
         self.config_essentials = {
@@ -187,6 +188,18 @@ class Loader(abc.ABC):
             "gateways": self.config.gateways,
         }
         _init_model_defaults(self.config_essentials, self.context.selected_gateway)
+
+    def set_model_batch_consumer(
+        self, consumer: t.Optional[t.Callable[[t.Tuple[Model, ...]], None]]
+    ) -> None:
+        """Sets a context-owned consumer for models discovered during the next load."""
+        self._model_batch_consumer = consumer
+
+    def _emit_model_batch(self, models: t.Iterable[Model]) -> None:
+        if self._model_batch_consumer is not None:
+            batch = tuple(models)
+            if batch:
+                self._model_batch_consumer(batch)
 
     def load(self) -> LoadedProject:
         """
@@ -549,6 +562,9 @@ class SqlMeshLoader(Loader):
         if duplicates:
             raise ConfigError(f"Duplicate model name(s) found: {', '.join(duplicates)}.")
 
+        self._emit_model_batch(external_models.values())
+        self._emit_model_batch(python_models.values())
+
         return UniqueKeyDict("models", **sql_models, **external_models, **python_models)
 
     def _load_sql_models(
@@ -566,6 +582,7 @@ class SqlMeshLoader(Loader):
         for loaded_models in self._iter_sql_model_batches(
             macros, jinja_macros, audits, signals, cache, gateway
         ):
+            enabled_models = []
             for model in loaded_models:
                 if model.fqn in models:
                     path = model._path or self.config_path
@@ -577,6 +594,8 @@ class SqlMeshLoader(Loader):
                     )
                 if model.enabled:
                     models[model.fqn] = model
+                    enabled_models.append(model)
+            self._emit_model_batch(enabled_models)
 
         return models
 

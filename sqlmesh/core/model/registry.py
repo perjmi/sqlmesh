@@ -30,7 +30,7 @@ class ModelMetadata:
     payload_digest: str = ""
 
     @classmethod
-    def from_model(cls, model: Model) -> ModelMetadata:
+    def from_model(cls, model: Model, *, include_payload_digest: bool = True) -> ModelMetadata:
         return cls(
             fqn=model.fqn,
             name=model.name,
@@ -44,28 +44,51 @@ class ModelMetadata:
             tags=tuple(model.tags),
             dbt_fqn=model.dbt_fqn,
             payload_key=model.fqn,
-            payload_digest=f"{model.data_hash}_{model.metadata_hash}",
+            payload_digest=(
+                f"{model.data_hash}_{model.metadata_hash}" if include_payload_digest else ""
+            ),
         )
+
+
+@dataclass(frozen=True)
+class StoredModelPayload:
+    """Serialized model plus hashes that model pickling intentionally clears."""
+
+    model: Model
+    data_hash: str
+    metadata_hash: str
 
 
 class ModelPayloadStore:
     """Versioned on-disk storage for independently hydrated model payloads."""
 
     def __init__(self, path: Path) -> None:
-        self._cache: FileCache[Model] = FileCache(path, prefix="model_payload")
+        self._cache: FileCache[t.Union[Model, StoredModelPayload]] = FileCache(
+            path, prefix="model_payload"
+        )
 
     def put(self, model: Model, metadata: ModelMetadata) -> None:
         self._cache.put(
             metadata.payload_key or metadata.fqn,
             metadata.payload_digest,
-            value=model,
+            value=StoredModelPayload(
+                model=model,
+                data_hash=model.data_hash,
+                metadata_hash=model.metadata_hash,
+            ),
         )
 
     def get(self, metadata: ModelMetadata) -> t.Optional[Model]:
-        return self._cache.get(
+        payload = self._cache.get(
             metadata.payload_key or metadata.fqn,
             metadata.payload_digest,
         )
+        if payload is None or isinstance(payload, Model):
+            return payload
+
+        payload.model._data_hash = payload.data_hash
+        payload.model._metadata_hash = payload.metadata_hash
+        return payload.model
 
 
 class ModelRegistry(t.Protocol):
@@ -125,9 +148,7 @@ class EagerModelRegistry(UniqueKeyDict[str, Model]):
     def match_names(self, pattern: str) -> t.Set[str]:
         import fnmatch
 
-        return {
-            model.fqn for model in self.values() if fnmatch.fnmatchcase(model.name, pattern)
-        }
+        return {model.fqn for model in self.values() if fnmatch.fnmatchcase(model.name, pattern)}
 
     def match_tags(self, pattern: str) -> t.Set[str]:
         import fnmatch
@@ -144,9 +165,7 @@ class EagerModelRegistry(UniqueKeyDict[str, Model]):
     def match_source_paths(self, paths: t.Collection[Path]) -> t.Set[str]:
         return {model.fqn for model in self.values() if model._path in paths}
 
-    def iter_metadata(
-        self, names: t.Optional[t.Iterable[str]] = None
-    ) -> t.Iterator[ModelMetadata]:
+    def iter_metadata(self, names: t.Optional[t.Iterable[str]] = None) -> t.Iterator[ModelMetadata]:
         selected_names = sorted(self if names is None else set(names))
         for name in selected_names:
             yield self.metadata(name)
@@ -229,9 +248,7 @@ class IndexedModelRegistry:
     def match_source_paths(self, paths: t.Collection[Path]) -> t.Set[str]:
         return self._index.match_source_paths(paths)
 
-    def iter_metadata(
-        self, names: t.Optional[t.Iterable[str]] = None
-    ) -> t.Iterator[ModelMetadata]:
+    def iter_metadata(self, names: t.Optional[t.Iterable[str]] = None) -> t.Iterator[ModelMetadata]:
         yield from self._index.iter_metadata(names)
 
     def upstream(self, names: t.Iterable[str]) -> t.Set[str]:

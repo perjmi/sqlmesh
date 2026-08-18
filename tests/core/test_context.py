@@ -2573,9 +2573,7 @@ def test_shadow_planner_persists_complete_model_graph(tmp_path):
     (models_path / "a.sql").write_text(
         "MODEL (name db.a, tags [daily]); SELECT 1 AS id", encoding="utf-8"
     )
-    (models_path / "b.sql").write_text(
-        "MODEL (name db.b); SELECT * FROM db.a", encoding="utf-8"
-    )
+    (models_path / "b.sql").write_text("MODEL (name db.b); SELECT * FROM db.a", encoding="utf-8")
     context = Context(
         paths=[tmp_path],
         config=Config(
@@ -2585,6 +2583,7 @@ def test_shadow_planner_persists_complete_model_graph(tmp_path):
     )
 
     assert context.model_graph_index is not None
+    assert context.model_discovery_max_batch_size == 1
     indexed_names = [metadata.fqn for metadata in context.model_graph_index.iter_metadata()]
     assert indexed_names == sorted(context.models)
     model_a = next(model for model in context.models.values() if model.name == "db.a")
@@ -2593,9 +2592,10 @@ def test_shadow_planner_persists_complete_model_graph(tmp_path):
     assert context.indexed_model_registry is not None
     assert context.indexed_model_registry.hydrate(model_a.fqn).dict() == model_a.dict()
     assert context._new_selector().expand_model_selections(["tag:daily"]) == {model_a.fqn}
-    assert context.model_graph_index.fingerprint(model_b.fqn) == context.snapshots[
-        model_b.fqn
-    ].fingerprint
+    assert (
+        context.model_graph_index.fingerprint(model_b.fqn)
+        == context.snapshots[model_b.fqn].fingerprint
+    )
     eager_diff = context._context_diff("dev", snapshots=context.snapshots)
     assert context.compact_context_diff is not None
     assert context.compact_context_diff.added == {
@@ -2613,6 +2613,7 @@ def test_eager_planner_does_not_create_model_graph_index(tmp_path):
 
     assert context.model_graph_index is None
     assert context.indexed_model_registry is None
+    assert context.model_discovery_max_batch_size == 0
 
 
 def test_requirements(copy_to_temp_path: t.Callable):

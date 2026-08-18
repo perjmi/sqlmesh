@@ -52,6 +52,10 @@ def test_project_graph_index_is_persistent_deterministic_and_replaceable(tmp_pat
     assert reopened.upstream({"c"}) == {"a", "b"}
     assert reopened.downstream({"a"}) == {"b", "c"}
     assert list(reopened.iter_metadata({"c", "a"})) == [records[1], records[0]]
+    assert [
+        tuple(record.fqn for record in batch)
+        for batch in reopened.iter_metadata_batches(batch_size=2)
+    ] == [("a", "b"), ("c",)]
 
     reopened.replace([_metadata("replacement")])
     assert [record.fqn for record in reopened.iter_metadata()] == ["replacement"]
@@ -67,6 +71,26 @@ def test_project_graph_index_replace_is_atomic(tmp_path):
         index.replace([duplicate, duplicate])
 
     assert list(index.iter_metadata()) == [original]
+
+
+def test_project_graph_index_incremental_replacement_is_atomic(tmp_path):
+    index = ProjectGraphIndex(tmp_path / "graph.sqlite")
+    original = _metadata("original")
+    index.replace([original])
+
+    with pytest.raises(RuntimeError, match="discovery failed"):
+        with index.replacing() as writer:
+            writer.add(_metadata("a"))
+            writer.add(_metadata("b", "a"))
+            raise RuntimeError("discovery failed")
+
+    assert list(index.iter_metadata()) == [original]
+
+    with index.replacing() as writer:
+        writer.add(_metadata("a"))
+        writer.add(_metadata("b", "a"))
+
+    assert [record.fqn for record in index.iter_metadata()] == ["a", "b"]
 
 
 def test_indexed_registry_hydrates_batches_with_a_bounded_lru(tmp_path):
@@ -101,6 +125,8 @@ def test_indexed_registry_hydrates_batches_with_a_bounded_lru(tmp_path):
 
 def test_model_payload_store_round_trips_models_by_metadata_digest(tmp_path):
     model = create_sql_model("db.model", parse_one("SELECT 1 AS id"))
+    model._data_hash = "authoritative_data_hash"
+    model._metadata_hash = "authoritative_metadata_hash"
     metadata = ModelMetadata.from_model(model)
     store = ModelPayloadStore(tmp_path / "payloads")
 
@@ -110,6 +136,8 @@ def test_model_payload_store_round_trips_models_by_metadata_digest(tmp_path):
     assert hydrated is not None
     assert hydrated.dict() == model.dict()
     assert hydrated is not model
+    assert hydrated.data_hash == "authoritative_data_hash"
+    assert hydrated.metadata_hash == "authoritative_metadata_hash"
     assert store.get(_metadata("missing")) is None
 
 
@@ -132,12 +160,8 @@ def test_indexed_metadata_selection_does_not_enumerate_model_records(tmp_path, m
 
 def test_streaming_fingerprints_match_eager_with_bounded_hydration(tmp_path):
     model_a = create_sql_model("a", parse_one("SELECT 1 AS id"))
-    model_b = create_sql_model(
-        "b", parse_one("SELECT * FROM a"), depends_on={model_a.fqn}
-    )
-    model_c = create_sql_model(
-        "c", parse_one("SELECT * FROM b"), depends_on={model_b.fqn}
-    )
+    model_b = create_sql_model("b", parse_one("SELECT * FROM a"), depends_on={model_a.fqn})
+    model_c = create_sql_model("c", parse_one("SELECT * FROM b"), depends_on={model_b.fqn})
     models = {model.fqn: model for model in (model_a, model_b, model_c)}
     index = ProjectGraphIndex(tmp_path / "graph.sqlite")
     metadata = [ModelMetadata.from_model(model) for model in models.values()]

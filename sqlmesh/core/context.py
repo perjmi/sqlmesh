@@ -87,6 +87,7 @@ from sqlmesh.core.model import Model, update_model_schemas
 from sqlmesh.core.model.registry import (
     EagerModelRegistry,
     IndexedModelRegistry,
+    ModelMetadata,
     ModelPayloadStore,
 )
 from sqlmesh.core.model.graph import ProjectGraphIndex
@@ -431,6 +432,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._model_graph_index: t.Optional[ProjectGraphIndex] = None
         self._indexed_model_registry: t.Optional[IndexedModelRegistry] = None
         self._compact_context_diff: t.Optional[CompactContextDiff] = None
+        self._model_discovery_max_batch_size = 0
 
         self.path, self.config = t.cast(t.Tuple[Path, C], next(iter(self.configs.items())))
 
@@ -660,7 +662,37 @@ class GenericContext(BaseContext, t.Generic[C]):
         """Load all files in the context's path."""
         load_start_ts = time.perf_counter()
 
-        loaded_projects = [loader.load() for loader in self._loaders]
+        self._model_discovery_max_batch_size = 0
+        if self.config.planner.mode == PlannerMode.EAGER:
+            loaded_projects = [loader.load() for loader in self._loaders]
+        else:
+            discovery_index = ProjectGraphIndex(self.cache_dir / "model_graph.sqlite")
+            with discovery_index.replacing() as writer:
+
+                def persist_model_batch(models: t.Tuple[Model, ...]) -> None:
+                    self._model_discovery_max_batch_size = max(
+                        self._model_discovery_max_batch_size, len(models)
+                    )
+                    for model in models:
+                        metadata = ModelMetadata.from_model(model, include_payload_digest=False)
+                        writer.add(metadata)
+
+                for loader in self._loaders:
+                    loader.set_model_batch_consumer(persist_model_batch)
+                try:
+                    loaded_projects = [loader.load() for loader in self._loaders]
+                finally:
+                    for loader in self._loaders:
+                        loader.set_model_batch_consumer(None)
+
+                # Third-party loaders may not expose incremental batches yet. Retain eager
+                # compatibility while making that fallback visible through the peak batch metric.
+                for project in loaded_projects:
+                    missing_models = tuple(
+                        model for model in project.models.values() if not writer.contains(model.fqn)
+                    )
+                    persist_model_batch(missing_models)
+            self._model_graph_index = discovery_index
 
         self.dag = DAG()
         self._standalone_audits.clear()
@@ -1117,6 +1149,11 @@ class GenericContext(BaseContext, t.Generic[C]):
         return self._indexed_model_registry
 
     @property
+    def model_discovery_max_batch_size(self) -> int:
+        """Largest hydrated model batch observed while building the graph index."""
+        return self._model_discovery_max_batch_size
+
+    @property
     def compact_context_diff(self) -> t.Optional[CompactContextDiff]:
         """Returns the most recent payload-free shadow context diff, if one was built."""
         return self._compact_context_diff
@@ -1129,14 +1166,36 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         index = ProjectGraphIndex(self.cache_dir / "model_graph.sqlite")
         payload_store = ModelPayloadStore(self.cache_dir)
-        eager_metadata = tuple(self._models.iter_metadata())
-        for metadata in eager_metadata:
-            payload_store.put(self._models[metadata.fqn], metadata)
-        index.replace(eager_metadata)
+        if index.model_count() != len(self._models):
+            raise SQLMeshError(
+                "The incrementally discovered model graph does not match the loaded project size"
+            )
 
-        indexed_metadata = tuple(index.iter_metadata())
-        if indexed_metadata != eager_metadata:
-            raise SQLMeshError("The indexed model graph does not match the eagerly loaded project graph")
+        eager_metadata_iterator = self._models.iter_metadata()
+        for indexed_batch in index.iter_metadata_batches(self.config.planner.model_batch_size):
+            final_metadata_batch = []
+            for indexed_metadata in indexed_batch:
+                eager_metadata = next(eager_metadata_iterator)
+                if (
+                    indexed_metadata.fqn != eager_metadata.fqn
+                    or indexed_metadata.name != eager_metadata.name
+                    or indexed_metadata.source_path != eager_metadata.source_path
+                    or indexed_metadata.project != eager_metadata.project
+                    or indexed_metadata.dialect != eager_metadata.dialect
+                    or indexed_metadata.gateway != eager_metadata.gateway
+                    or indexed_metadata.enabled != eager_metadata.enabled
+                    or indexed_metadata.kind_name != eager_metadata.kind_name
+                    or indexed_metadata.dependencies != eager_metadata.dependencies
+                    or indexed_metadata.tags != eager_metadata.tags
+                    or indexed_metadata.dbt_fqn != eager_metadata.dbt_fqn
+                ):
+                    raise SQLMeshError(
+                        f"Incremental discovery metadata for '{eager_metadata.fqn}' does not "
+                        "match the loaded project"
+                    )
+                payload_store.put(self._models[eager_metadata.fqn], eager_metadata)
+                final_metadata_batch.append(eager_metadata)
+            index.update_payload_references(final_metadata_batch)
 
         def hydrate_model(name: str) -> Model:
             metadata = index.metadata(name)
@@ -1167,8 +1226,19 @@ class GenericContext(BaseContext, t.Generic[C]):
                 for model in self._models.values()
             }
             if streamed_fingerprints != eager_fingerprints:
+                mismatched_names = sorted(
+                    name
+                    for name in streamed_fingerprints.keys() | eager_fingerprints.keys()
+                    if streamed_fingerprints.get(name) != eager_fingerprints.get(name)
+                )
+                mismatch_details = "; ".join(
+                    f"{name}: streamed={streamed_fingerprints.get(name)}, "
+                    f"eager={eager_fingerprints.get(name)}"
+                    for name in mismatched_names
+                )
                 raise SQLMeshError(
-                    "The streamed model fingerprints do not match eager fingerprinting"
+                    "The streamed model fingerprints do not match eager fingerprinting for: "
+                    f"{', '.join(mismatched_names)} ({mismatch_details})"
                 )
         else:
             for _ in fingerprinter.fingerprint():
@@ -3080,12 +3150,10 @@ class GenericContext(BaseContext, t.Generic[C]):
         )
         if self.config.planner.mode == PlannerMode.SHADOW and self._model_graph_index is not None:
             existing_environment = self.state_reader.get_environment(environment)
-            recreate_environment = always_recreate_environment and environment != (create_from or c.PROD)
-            if (
-                existing_environment is None
-                or existing_environment.expired
-                or recreate_environment
-            ):
+            recreate_environment = always_recreate_environment and environment != (
+                create_from or c.PROD
+            )
+            if existing_environment is None or existing_environment.expired or recreate_environment:
                 comparison_environment = self.state_reader.get_environment(create_from or c.PROD)
             else:
                 comparison_environment = existing_environment
@@ -3108,7 +3176,9 @@ class GenericContext(BaseContext, t.Generic[C]):
             )
             indexed_names = set(self._model_graph_index.iter_names())
             eager_added = {
-                snapshot_id for snapshot_id in context_diff.added if snapshot_id.name in indexed_names
+                snapshot_id
+                for snapshot_id in context_diff.added
+                if snapshot_id.name in indexed_names
             }
             eager_removed = {
                 snapshot_id
@@ -3124,9 +3194,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                 or set(compact_diff.removed) != eager_removed
                 or set(compact_diff.modified) != eager_modified
             ):
-                raise SQLMeshError(
-                    "The compact context diff does not match the eager context diff"
-                )
+                raise SQLMeshError("The compact context diff does not match the eager context diff")
             self._compact_context_diff = compact_diff
         return context_diff
 

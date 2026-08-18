@@ -5,11 +5,53 @@ import sqlite3
 import typing as t
 import fnmatch
 import heapq
+from contextlib import contextmanager
 from pathlib import Path
 
 from sqlmesh.core.model.registry import ModelMetadata
 from sqlmesh.core.snapshot.definition import SnapshotFingerprint
 from sqlmesh.utils.errors import SQLMeshError
+
+
+class ProjectGraphWriter:
+    """Transaction-scoped writer for an incrementally discovered project graph."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, record: ModelMetadata) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO models(
+                fqn, name, source_path, project, dialect, gateway, enabled,
+                kind_name, tags, dbt_fqn, payload_key, payload_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.fqn,
+                record.name,
+                str(record.source_path) if record.source_path is not None else None,
+                record.project,
+                record.dialect,
+                record.gateway,
+                record.enabled,
+                record.kind_name,
+                json.dumps(record.tags),
+                record.dbt_fqn,
+                record.payload_key,
+                record.payload_digest,
+            ),
+        )
+        self._connection.executemany(
+            "INSERT INTO model_dependencies(model_fqn, dependency_fqn) VALUES (?, ?)",
+            ((record.fqn, dependency) for dependency in record.dependencies),
+        )
+
+    def contains(self, name: str) -> bool:
+        return (
+            self._connection.execute("SELECT 1 FROM models WHERE fqn = ?", (name,)).fetchone()
+            is not None
+        )
 
 
 class ProjectGraphIndex:
@@ -91,36 +133,24 @@ class ProjectGraphIndex:
 
     def replace(self, records: t.Iterable[ModelMetadata]) -> None:
         """Atomically replaces the complete indexed graph."""
-        with self._connect() as connection:
+        with self.replacing() as writer:
+            for record in records:
+                writer.add(record)
+
+    @contextmanager
+    def replacing(self) -> t.Iterator[ProjectGraphWriter]:
+        """Opens an atomic replacement that can be populated one record at a time."""
+        connection = self._connect()
+        try:
             connection.execute("DELETE FROM model_dependencies")
             connection.execute("DELETE FROM models")
-            for record in records:
-                connection.execute(
-                    """
-                    INSERT INTO models(
-                        fqn, name, source_path, project, dialect, gateway, enabled,
-                        kind_name, tags, dbt_fqn, payload_key, payload_digest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        record.fqn,
-                        record.name,
-                        str(record.source_path) if record.source_path is not None else None,
-                        record.project,
-                        record.dialect,
-                        record.gateway,
-                        record.enabled,
-                        record.kind_name,
-                        json.dumps(record.tags),
-                        record.dbt_fqn,
-                        record.payload_key,
-                        record.payload_digest,
-                    ),
-                )
-                connection.executemany(
-                    "INSERT INTO model_dependencies(model_fqn, dependency_fqn) VALUES (?, ?)",
-                    ((record.fqn, dependency) for dependency in record.dependencies),
-                )
+            yield ProjectGraphWriter(connection)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def metadata(self, name: str) -> ModelMetadata:
         with self._connect() as connection:
@@ -144,6 +174,27 @@ class ProjectGraphIndex:
                 connection.execute("SELECT 1 FROM models WHERE fqn = ?", (name,)).fetchone()
                 is not None
             )
+
+    def model_count(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute("SELECT COUNT(*) AS count FROM models").fetchone()
+        return int(row["count"])
+
+    def update_payload_reference(self, record: ModelMetadata) -> None:
+        """Updates a payload after schema propagation without rebuilding graph metadata."""
+        self.update_payload_references((record,))
+
+    def update_payload_references(self, records: t.Iterable[ModelMetadata]) -> None:
+        """Updates a bounded batch of post-schema payload references."""
+        with self._connect() as connection:
+            updates = tuple(
+                (record.payload_key, record.payload_digest, record.fqn) for record in records
+            )
+            connection.executemany(
+                "UPDATE models SET payload_key = ?, payload_digest = ? WHERE fqn = ?", updates
+            )
+            if connection.total_changes != len(updates):
+                raise KeyError("One or more model payload references do not exist")
 
     def iter_names(self) -> t.Iterator[str]:
         with self._connect() as connection:
@@ -195,9 +246,7 @@ class ProjectGraphIndex:
                 if row["source_path"] in path_strings
             }
 
-    def iter_metadata(
-        self, names: t.Optional[t.Iterable[str]] = None
-    ) -> t.Iterator[ModelMetadata]:
+    def iter_metadata(self, names: t.Optional[t.Iterable[str]] = None) -> t.Iterator[ModelMetadata]:
         selected_names = None if names is None else set(names)
         with self._connect() as connection:
             rows = connection.execute(
@@ -212,6 +261,32 @@ class ProjectGraphIndex:
             for row in rows:
                 if selected_names is None or row["fqn"] in selected_names:
                     yield self._row_to_metadata(row)
+
+    def iter_metadata_batches(self, batch_size: int) -> t.Iterator[t.Tuple[ModelMetadata, ...]]:
+        """Yields all metadata using keyset pagination and bounded SQLite result sets."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than 0")
+
+        last_fqn = ""
+        while True:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT m.*, GROUP_CONCAT(d.dependency_fqn, char(31)) AS dependencies
+                    FROM models AS m
+                    LEFT JOIN model_dependencies AS d ON d.model_fqn = m.fqn
+                    WHERE m.fqn > ?
+                    GROUP BY m.fqn
+                    ORDER BY m.fqn
+                    LIMIT ?
+                    """,
+                    (last_fqn, batch_size),
+                ).fetchall()
+            if not rows:
+                return
+            batch = tuple(self._row_to_metadata(row) for row in rows)
+            yield batch
+            last_fqn = batch[-1].fqn
 
     def upstream(self, names: t.Iterable[str]) -> t.Set[str]:
         result: t.Set[str] = set()
@@ -292,9 +367,7 @@ class ProjectGraphIndex:
         with self._connect() as connection:
             connection.execute("DELETE FROM model_fingerprints")
 
-    def put_fingerprints(
-        self, fingerprints: t.Iterable[t.Tuple[str, SnapshotFingerprint]]
-    ) -> None:
+    def put_fingerprints(self, fingerprints: t.Iterable[t.Tuple[str, SnapshotFingerprint]]) -> None:
         with self._connect() as connection:
             connection.executemany(
                 """
