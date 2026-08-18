@@ -4,6 +4,25 @@ This document describes an incremental implementation of a bounded-working-set S
 The implementation lives on the `streaming` branch until it reaches semantic parity with the eager
 planner.
 
+## Implementation status
+
+The branch currently implements the shadow-safe foundation and keeps eager application as the oracle:
+
+- `planner.mode` configuration and eager-compatible cache defaults.
+- An entry-bounded snapshot LRU and deterministic batched state hydration APIs.
+- A dict-compatible eager registry plus a bounded indexed registry backed by per-model payload files.
+- A transactional, versioned SQLite graph index with indexed selection and dependency queries.
+- Topological, batch-bounded fingerprinting that persists results before model eviction.
+- A compact first-pass context diff based on snapshot headers.
+- Shadow checks for graph round-trips, selection, fingerprints, and context-diff change sets.
+- A two-Postgres random-graph oracle that runs eager reference plans against shadow candidates.
+
+The production streaming cutover is deliberately not claimed yet. `Loader.load` and the public
+`Context.models` compatibility surface still construct the eager model dictionary; `ContextDiff`, `Plan`,
+and plan stages still retain full snapshot payloads; and streaming application/checkpoints remain delivery
+milestones D and E below. This boundary prevents an opt-in mode from silently applying mixed semantics
+before the remaining accuracy and failure-injection gates pass.
+
 ## Goals
 
 - Preserve the complete-project semantics of model selection, change propagation, fingerprinting,
