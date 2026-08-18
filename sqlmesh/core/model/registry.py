@@ -7,6 +7,7 @@ from pathlib import Path
 
 from sqlmesh.core.model.definition import Model
 from sqlmesh.utils import UniqueKeyDict
+from sqlmesh.utils.cache import FileCache
 from sqlmesh.utils.dag import DAG
 
 
@@ -25,6 +26,8 @@ class ModelMetadata:
     dependencies: t.Tuple[str, ...]
     tags: t.Tuple[str, ...]
     dbt_fqn: t.Optional[str]
+    payload_key: str = ""
+    payload_digest: str = ""
 
     @classmethod
     def from_model(cls, model: Model) -> ModelMetadata:
@@ -40,6 +43,28 @@ class ModelMetadata:
             dependencies=tuple(sorted(model.depends_on)),
             tags=tuple(model.tags),
             dbt_fqn=model.dbt_fqn,
+            payload_key=model.fqn,
+            payload_digest=f"{model.data_hash}_{model.metadata_hash}",
+        )
+
+
+class ModelPayloadStore:
+    """Versioned on-disk storage for independently hydrated model payloads."""
+
+    def __init__(self, path: Path) -> None:
+        self._cache: FileCache[Model] = FileCache(path, prefix="model_payload")
+
+    def put(self, model: Model, metadata: ModelMetadata) -> None:
+        self._cache.put(
+            metadata.payload_key or metadata.fqn,
+            metadata.payload_digest,
+            value=model,
+        )
+
+    def get(self, metadata: ModelMetadata) -> t.Optional[Model]:
+        return self._cache.get(
+            metadata.payload_key or metadata.fqn,
+            metadata.payload_digest,
         )
 
 
@@ -47,6 +72,18 @@ class ModelRegistry(t.Protocol):
     """Read interface shared by eager and indexed model stores."""
 
     def metadata(self, name: str) -> ModelMetadata: ...
+
+    def contains(self, name: str) -> bool: ...
+
+    def iter_names(self) -> t.Iterator[str]: ...
+
+    def match_names(self, pattern: str) -> t.Set[str]: ...
+
+    def match_tags(self, pattern: str) -> t.Set[str]: ...
+
+    def match_kinds(self, kind_names: t.Collection[str]) -> t.Set[str]: ...
+
+    def match_source_paths(self, paths: t.Collection[Path]) -> t.Set[str]: ...
 
     def iter_metadata(
         self, names: t.Optional[t.Iterable[str]] = None
@@ -78,6 +115,34 @@ class EagerModelRegistry(UniqueKeyDict[str, Model]):
 
     def metadata(self, name: str) -> ModelMetadata:
         return ModelMetadata.from_model(self[name])
+
+    def contains(self, name: str) -> bool:
+        return name in self
+
+    def iter_names(self) -> t.Iterator[str]:
+        yield from sorted(self)
+
+    def match_names(self, pattern: str) -> t.Set[str]:
+        import fnmatch
+
+        return {
+            model.fqn for model in self.values() if fnmatch.fnmatchcase(model.name, pattern)
+        }
+
+    def match_tags(self, pattern: str) -> t.Set[str]:
+        import fnmatch
+
+        return {
+            model.fqn
+            for model in self.values()
+            if any(fnmatch.fnmatchcase(tag.lower(), pattern.lower()) for tag in model.tags)
+        }
+
+    def match_kinds(self, kind_names: t.Collection[str]) -> t.Set[str]:
+        return {model.fqn for model in self.values() if str(model.kind.name) in kind_names}
+
+    def match_source_paths(self, paths: t.Collection[Path]) -> t.Set[str]:
+        return {model.fqn for model in self.values() if model._path in paths}
 
     def iter_metadata(
         self, names: t.Optional[t.Iterable[str]] = None
@@ -145,6 +210,24 @@ class IndexedModelRegistry:
 
     def metadata(self, name: str) -> ModelMetadata:
         return self._index.metadata(name)
+
+    def contains(self, name: str) -> bool:
+        return self._index.contains(name)
+
+    def iter_names(self) -> t.Iterator[str]:
+        yield from self._index.iter_names()
+
+    def match_names(self, pattern: str) -> t.Set[str]:
+        return self._index.match_names(pattern)
+
+    def match_tags(self, pattern: str) -> t.Set[str]:
+        return self._index.match_tags(pattern)
+
+    def match_kinds(self, kind_names: t.Collection[str]) -> t.Set[str]:
+        return self._index.match_kinds(kind_names)
+
+    def match_source_paths(self, paths: t.Collection[Path]) -> t.Set[str]:
+        return self._index.match_source_paths(paths)
 
     def iter_metadata(
         self, names: t.Optional[t.Iterable[str]] = None

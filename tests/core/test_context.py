@@ -2590,6 +2590,12 @@ def test_shadow_planner_persists_complete_model_graph(tmp_path):
     model_a = next(model for model in context.models.values() if model.name == "db.a")
     model_b = next(model for model in context.models.values() if model.name == "db.b")
     assert context.model_graph_index.upstream({model_b.fqn}) == {model_a.fqn}
+    assert context.indexed_model_registry is not None
+    assert context.indexed_model_registry.hydrate(model_a.fqn).dict() == model_a.dict()
+    assert context._new_selector().expand_model_selections(["tag:daily"]) == {model_a.fqn}
+    assert context.model_graph_index.fingerprint(model_b.fqn) == context.snapshots[
+        model_b.fqn
+    ].fingerprint
 
 
 def test_eager_planner_does_not_create_model_graph_index(tmp_path):
@@ -2599,6 +2605,7 @@ def test_eager_planner_does_not_create_model_graph_index(tmp_path):
     )
 
     assert context.model_graph_index is None
+    assert context.indexed_model_registry is None
 
 
 def test_requirements(copy_to_temp_path: t.Callable):

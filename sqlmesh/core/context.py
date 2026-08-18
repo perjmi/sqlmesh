@@ -83,7 +83,11 @@ from sqlmesh.core.linter.rules import BUILTIN_RULES
 from sqlmesh.core.macros import ExecutableOrMacro, macro
 from sqlmesh.core.metric import Metric, rewrite
 from sqlmesh.core.model import Model, update_model_schemas
-from sqlmesh.core.model.registry import EagerModelRegistry
+from sqlmesh.core.model.registry import (
+    EagerModelRegistry,
+    IndexedModelRegistry,
+    ModelPayloadStore,
+)
 from sqlmesh.core.model.graph import ProjectGraphIndex
 from sqlmesh.core.config.model import ModelDefaultsConfig
 from sqlmesh.core.notification_target import (
@@ -96,7 +100,7 @@ from sqlmesh.core.plan.definition import UserProvidedFlags
 from sqlmesh.core.reference import ReferenceGraph
 from sqlmesh.core.scheduler import Scheduler, CompletionStatus
 from sqlmesh.core.schema_loader import create_external_models_file
-from sqlmesh.core.selector import Selector, NativeSelector
+from sqlmesh.core.selector import MetadataSelector, Selector, ShadowSelector, NativeSelector
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
     Snapshot,
@@ -105,7 +109,8 @@ from sqlmesh.core.snapshot import (
     missing_intervals,
     to_table_mapping,
 )
-from sqlmesh.core.snapshot.definition import get_next_model_interval_start
+from sqlmesh.core.snapshot.definition import fingerprint_from_node, get_next_model_interval_start
+from sqlmesh.core.snapshot.streaming import StreamingFingerprinter
 from sqlmesh.core.state_sync import (
     CachingStateSync,
     StateReader,
@@ -423,6 +428,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._load_state: bool = load_state
         self._selector_cls = selector or NativeSelector
         self._model_graph_index: t.Optional[ProjectGraphIndex] = None
+        self._indexed_model_registry: t.Optional[IndexedModelRegistry] = None
 
         self.path, self.config = t.cast(t.Tuple[Path, C], next(iter(self.configs.items())))
 
@@ -1103,19 +1109,66 @@ class GenericContext(BaseContext, t.Generic[C]):
         """Returns the compact project graph used by shadow and streaming planners."""
         return self._model_graph_index
 
+    @property
+    def indexed_model_registry(self) -> t.Optional[IndexedModelRegistry]:
+        """Returns the bounded, on-demand model registry when indexing is enabled."""
+        return self._indexed_model_registry
+
     def _refresh_model_graph_index(self) -> None:
         if self.config.planner.mode == PlannerMode.EAGER:
             self._model_graph_index = None
+            self._indexed_model_registry = None
             return
 
         index = ProjectGraphIndex(self.cache_dir / "model_graph.sqlite")
-        index.replace(self._models.iter_metadata())
-
+        payload_store = ModelPayloadStore(self.cache_dir)
         eager_metadata = tuple(self._models.iter_metadata())
+        for metadata in eager_metadata:
+            payload_store.put(self._models[metadata.fqn], metadata)
+        index.replace(eager_metadata)
+
         indexed_metadata = tuple(index.iter_metadata())
         if indexed_metadata != eager_metadata:
             raise SQLMeshError("The indexed model graph does not match the eagerly loaded project graph")
+
+        def hydrate_model(name: str) -> Model:
+            metadata = index.metadata(name)
+            model = payload_store.get(metadata)
+            if model is None:
+                raise SQLMeshError(f"Missing indexed model payload for '{name}'")
+            return model
+
+        indexed_registry = IndexedModelRegistry(
+            index,
+            hydrate_model,
+            max_entries=self.config.planner.hydrated_model_cache_size,
+        )
+        fingerprinter = StreamingFingerprinter(
+            index,
+            indexed_registry,
+            batch_size=self.config.planner.model_batch_size,
+        )
+        if self.config.planner.mode == PlannerMode.SHADOW:
+            streamed_fingerprints = dict(fingerprinter.fingerprint())
+            eager_fingerprint_cache: t.Dict[str, SnapshotFingerprint] = {}
+            eager_fingerprints = {
+                model.fqn: fingerprint_from_node(
+                    model,
+                    nodes=self._models,
+                    cache=eager_fingerprint_cache,
+                )
+                for model in self._models.values()
+            }
+            if streamed_fingerprints != eager_fingerprints:
+                raise SQLMeshError(
+                    "The streamed model fingerprints do not match eager fingerprinting"
+                )
+        else:
+            for _ in fingerprinter.fingerprint():
+                pass
+
         self._model_graph_index = index
+        self._indexed_model_registry = indexed_registry
 
     @property
     def metrics(self) -> MappingProxyType[str, Metric]:
@@ -3189,8 +3242,8 @@ class GenericContext(BaseContext, t.Generic[C]):
 
     def _new_selector(
         self, models: t.Optional[UniqueKeyDict[str, Model]] = None, dag: t.Optional[DAG[str]] = None
-    ) -> Selector:
-        return self._selector_cls(
+    ) -> t.Union[Selector, ShadowSelector]:
+        selector = self._selector_cls(
             self.state_reader,
             models=models or self._models,
             context_path=self.path,
@@ -3199,6 +3252,21 @@ class GenericContext(BaseContext, t.Generic[C]):
             dialect=self.default_dialect,
             cache_dir=self.cache_dir,
         )
+        if (
+            self.config.planner.mode == PlannerMode.SHADOW
+            and models is None
+            and dag is None
+            and self._indexed_model_registry is not None
+        ):
+            metadata_selector = MetadataSelector(
+                self._indexed_model_registry,
+                context_path=self.path,
+                default_catalog=self.default_catalog,
+                dialect=self.default_dialect,
+            )
+            local_names = set(self._indexed_model_registry.iter_names())
+            return ShadowSelector(selector, metadata_selector, local_names)
+        return selector
 
     def _register_notification_targets(self) -> None:
         event_notifications = collections.defaultdict(set)

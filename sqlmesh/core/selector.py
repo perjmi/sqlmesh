@@ -16,7 +16,7 @@ from sqlmesh.core import constants as c
 from sqlmesh.core.dialect import normalize_model_name
 from sqlmesh.core.environment import Environment
 from sqlmesh.core.model import update_model_schemas
-from sqlmesh.core.model.registry import ModelMetadata, ModelRegistry
+from sqlmesh.core.model.registry import ModelRegistry
 from sqlmesh.core.audit import StandaloneAudit
 from sqlmesh.utils import UniqueKeyDict
 from sqlmesh.utils.dag import DAG
@@ -531,29 +531,18 @@ class MetadataSelector:
 
     def expand_model_selections(self, model_selections: t.Iterable[str]) -> t.Set[str]:
         node = parse(" | ".join(f"({selection})" for selection in model_selections))
-        records = tuple(self._registry.iter_metadata())
-        records_by_name = {record.fqn: record for record in records}
-        all_names = set(records_by_name)
-        models_by_tags: t.Dict[str, t.Set[str]] = {}
-        for record in records:
-            for tag in record.tags:
-                models_by_tags.setdefault(tag.lower(), set()).add(record.fqn)
 
         def evaluate(expression: exp.Expr) -> t.Set[str]:
             if isinstance(expression, exp.Var):
                 pattern = expression.name
                 if "*" in pattern:
-                    return {
-                        record.fqn
-                        for record in records
-                        if fnmatch.fnmatchcase(record.name, pattern)
-                    }
+                    return self._registry.match_names(pattern)
                 fqn = normalize_model_name(
                     pattern,
                     default_catalog=self._default_catalog,
                     dialect=self._dialect,
                 )
-                return {fqn} if fqn in records_by_name else set()
+                return {fqn} if self._registry.contains(fqn) else set()
             if isinstance(expression, exp.And):
                 return evaluate(expression.left) & evaluate(expression.right)
             if isinstance(expression, exp.Or):
@@ -561,44 +550,44 @@ class MetadataSelector:
             if isinstance(expression, exp.Paren):
                 return evaluate(expression.this)
             if isinstance(expression, exp.Not):
-                return all_names - evaluate(expression.this)
+                return set(self._registry.iter_names()) - evaluate(expression.this)
             if isinstance(expression, Git):
                 git_modified_files = {
                     *self._git_client.list_untracked_files(),
                     *self._git_client.list_uncommitted_changed_files(),
                     *self._git_client.list_committed_changed_files(target_branch=expression.name),
                 }
-                return {
-                    record.fqn
-                    for record in records
-                    if record.source_path is not None and record.source_path in git_modified_files
-                }
+                return self._registry.match_source_paths(git_modified_files)
             if isinstance(expression, Tag):
                 pattern = expression.name.lower()
-                if "*" in pattern:
-                    return {
-                        model
-                        for tag, models in models_by_tags.items()
-                        for model in models
-                        if fnmatch.fnmatchcase(tag, pattern)
-                    }
-                return models_by_tags.get(pattern, set())
+                return self._registry.match_tags(pattern)
             if isinstance(expression, ResourceType):
                 resource_type = expression.name.lower()
                 if resource_type not in ("model", "seed", "source"):
                     raise SQLMeshError(f"Unsupported resource type: {resource_type}")
-                return {
-                    record.fqn
-                    for record in records
-                    if self._matches_resource_type(resource_type, record)
-                }
+                if resource_type == "seed":
+                    return self._registry.match_kinds({"SEED"})
+                if resource_type == "source":
+                    return self._registry.match_kinds({"EXTERNAL"})
+                symbolic_kinds = {"SEED", "EXTERNAL"}
+                return set(self._registry.iter_names()) - self._registry.match_kinds(
+                    symbolic_kinds
+                )
             if isinstance(expression, Direction):
                 selected = evaluate(expression.this)
                 result = set(selected)
                 if expression.args.get("up"):
-                    result.update(self._registry.upstream(selected) & all_names)
+                    result.update(
+                        name
+                        for name in self._registry.upstream(selected)
+                        if self._registry.contains(name)
+                    )
                 if expression.args.get("down"):
-                    result.update(self._registry.downstream(selected) & all_names)
+                    result.update(
+                        name
+                        for name in self._registry.downstream(selected)
+                        if self._registry.contains(name)
+                    )
                 return result
             raise ParseError(f"Unexpected node {expression}")
 
@@ -609,17 +598,64 @@ class MetadataSelector:
     ) -> t.Tuple[t.Set[str], t.Set[str], t.Set[str]]:
         """Returns selected models and their disjoint upstream/downstream boundaries."""
         selected = self.expand_model_selections(model_selections)
-        known_names = {metadata.fqn for metadata in self._registry.iter_metadata()}
-        upstream = (self._registry.upstream(selected) & known_names) - selected
-        downstream = (
-            self._registry.downstream(selected) & known_names
-        ) - selected - upstream
+        upstream = {
+            name
+            for name in self._registry.upstream(selected)
+            if self._registry.contains(name) and name not in selected
+        }
+        downstream = {
+            name
+            for name in self._registry.downstream(selected)
+            if self._registry.contains(name) and name not in selected and name not in upstream
+        }
         return selected, upstream, downstream
 
-    @staticmethod
-    def _matches_resource_type(resource_type: str, record: ModelMetadata) -> bool:
-        if resource_type == "seed":
-            return record.kind_name == "SEED"
-        if resource_type == "source":
-            return record.kind_name == "EXTERNAL"
-        return record.kind_name not in ("SEED", "EXTERNAL")
+
+class ShadowSelector:
+    """Runs eager selection while requiring metadata-only selection to produce the same result."""
+
+    def __init__(
+        self,
+        eager_selector: Selector,
+        metadata_selector: MetadataSelector,
+        local_names: t.Set[str],
+    ) -> None:
+        self._eager_selector = eager_selector
+        self._metadata_selector = metadata_selector
+        self._local_names = local_names
+
+    def _validate(self, selections: t.Iterable[str], eager_result: t.Set[str]) -> None:
+        selection_list = tuple(selections)
+        metadata_result = self._metadata_selector.expand_model_selections(selection_list)
+        local_eager_result = eager_result & self._local_names
+        if metadata_result != local_eager_result:
+            raise SQLMeshError(
+                "Streaming metadata selection mismatch: "
+                f"eager={sorted(local_eager_result)}, metadata={sorted(metadata_result)}"
+            )
+
+    def expand_model_selections(
+        self, model_selections: t.Iterable[str], models: t.Optional[t.Dict[str, Node]] = None
+    ) -> t.Set[str]:
+        selections = tuple(model_selections)
+        eager_result = self._eager_selector.expand_model_selections(selections, models=models)
+        if models is None:
+            self._validate(selections, eager_result)
+        return eager_result
+
+    def select_models(
+        self,
+        model_selections: t.Iterable[str],
+        target_env_name: str,
+        fallback_env_name: t.Optional[str] = None,
+        ensure_finalized_snapshots: bool = False,
+    ) -> t.Tuple[UniqueKeyDict[str, Model], t.Set[str]]:
+        selections = tuple(model_selections)
+        models, eager_result = self._eager_selector.select_models(
+            selections,
+            target_env_name,
+            fallback_env_name=fallback_env_name,
+            ensure_finalized_snapshots=ensure_finalized_snapshots,
+        )
+        self._validate(selections, eager_result)
+        return models, eager_result

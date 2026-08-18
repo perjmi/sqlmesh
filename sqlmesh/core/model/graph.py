@@ -3,15 +3,19 @@ from __future__ import annotations
 import json
 import sqlite3
 import typing as t
+import fnmatch
+import heapq
 from pathlib import Path
 
 from sqlmesh.core.model.registry import ModelMetadata
+from sqlmesh.core.snapshot.definition import SnapshotFingerprint
+from sqlmesh.utils.errors import SQLMeshError
 
 
 class ProjectGraphIndex:
     """A disposable, transactional SQLite index of lightweight model metadata."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -34,6 +38,7 @@ class ProjectGraphIndex:
             ).fetchone()
             if row is not None and int(row["value"]) != self.SCHEMA_VERSION:
                 connection.execute("DROP TABLE IF EXISTS model_dependencies")
+                connection.execute("DROP TABLE IF EXISTS model_fingerprints")
                 connection.execute("DROP TABLE IF EXISTS models")
                 connection.execute("DELETE FROM graph_meta")
 
@@ -49,7 +54,9 @@ class ProjectGraphIndex:
                     enabled INTEGER NOT NULL,
                     kind_name TEXT NOT NULL,
                     tags TEXT NOT NULL,
-                    dbt_fqn TEXT
+                    dbt_fqn TEXT,
+                    payload_key TEXT NOT NULL,
+                    payload_digest TEXT NOT NULL
                 )
                 """
             )
@@ -67,6 +74,17 @@ class ProjectGraphIndex:
                 "ON model_dependencies(dependency_fqn, model_fqn)"
             )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS model_fingerprints (
+                    fqn TEXT PRIMARY KEY REFERENCES models(fqn) ON DELETE CASCADE,
+                    data_hash TEXT NOT NULL,
+                    metadata_hash TEXT NOT NULL,
+                    parent_data_hash TEXT NOT NULL,
+                    parent_metadata_hash TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
                 "INSERT OR REPLACE INTO graph_meta(key, value) VALUES ('schema_version', ?)",
                 (str(self.SCHEMA_VERSION),),
             )
@@ -81,8 +99,8 @@ class ProjectGraphIndex:
                     """
                     INSERT INTO models(
                         fqn, name, source_path, project, dialect, gateway, enabled,
-                        kind_name, tags, dbt_fqn
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        kind_name, tags, dbt_fqn, payload_key, payload_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.fqn,
@@ -95,6 +113,8 @@ class ProjectGraphIndex:
                         record.kind_name,
                         json.dumps(record.tags),
                         record.dbt_fqn,
+                        record.payload_key,
+                        record.payload_digest,
                     ),
                 )
                 connection.executemany(
@@ -117,6 +137,63 @@ class ProjectGraphIndex:
         if row is None:
             raise KeyError(name)
         return self._row_to_metadata(row)
+
+    def contains(self, name: str) -> bool:
+        with self._connect() as connection:
+            return (
+                connection.execute("SELECT 1 FROM models WHERE fqn = ?", (name,)).fetchone()
+                is not None
+            )
+
+    def iter_names(self) -> t.Iterator[str]:
+        with self._connect() as connection:
+            for row in connection.execute("SELECT fqn FROM models ORDER BY fqn"):
+                yield row["fqn"]
+
+    def match_names(self, pattern: str) -> t.Set[str]:
+        with self._connect() as connection:
+            return {
+                row["fqn"]
+                for row in connection.execute("SELECT fqn, name FROM models")
+                if fnmatch.fnmatchcase(row["name"], pattern)
+            }
+
+    def match_tags(self, pattern: str) -> t.Set[str]:
+        with self._connect() as connection:
+            return {
+                row["fqn"]
+                for row in connection.execute("SELECT fqn, tags FROM models")
+                if any(
+                    fnmatch.fnmatchcase(tag.lower(), pattern.lower())
+                    for tag in json.loads(row["tags"])
+                )
+            }
+
+    def match_kinds(self, kind_names: t.Collection[str]) -> t.Set[str]:
+        if not kind_names:
+            return set()
+        placeholders = ", ".join("?" for _ in kind_names)
+        with self._connect() as connection:
+            return {
+                row["fqn"]
+                for row in connection.execute(
+                    f"SELECT fqn FROM models WHERE kind_name IN ({placeholders})",  # noqa: S608
+                    tuple(kind_names),
+                )
+            }
+
+    def match_source_paths(self, paths: t.Collection[Path]) -> t.Set[str]:
+        if not paths:
+            return set()
+        path_strings = {str(path) for path in paths}
+        with self._connect() as connection:
+            return {
+                row["fqn"]
+                for row in connection.execute(
+                    "SELECT fqn, source_path FROM models WHERE source_path IS NOT NULL"
+                )
+                if row["source_path"] in path_strings
+            }
 
     def iter_metadata(
         self, names: t.Optional[t.Iterable[str]] = None
@@ -176,6 +253,81 @@ class ProjectGraphIndex:
                 result.update(row["fqn"] for row in rows)
         return result
 
+    def iter_topological_batches(self, batch_size: int) -> t.Iterator[t.Tuple[str, ...]]:
+        """Yields deterministic topological batches without hydrating model payloads."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than 0")
+
+        names = set(self.iter_names())
+        dependencies = {name: set() for name in names}
+        downstream = {name: set() for name in names}
+        with self._connect() as connection:
+            for row in connection.execute(
+                "SELECT model_fqn, dependency_fqn FROM model_dependencies"
+            ):
+                model_name = row["model_fqn"]
+                dependency_name = row["dependency_fqn"]
+                if dependency_name in names:
+                    dependencies[model_name].add(dependency_name)
+                    downstream[dependency_name].add(model_name)
+
+        ready = [name for name, parents in dependencies.items() if not parents]
+        heapq.heapify(ready)
+        processed = 0
+        while ready:
+            batch = tuple(heapq.heappop(ready) for _ in range(min(batch_size, len(ready))))
+            yield batch
+            processed += len(batch)
+            for name in batch:
+                for child in downstream[name]:
+                    dependencies[child].discard(name)
+                    if not dependencies[child]:
+                        heapq.heappush(ready, child)
+
+        if processed != len(names):
+            cyclic_names = sorted(name for name, parents in dependencies.items() if parents)
+            raise SQLMeshError(f"Detected a cycle in the indexed model graph: {cyclic_names}")
+
+    def clear_fingerprints(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM model_fingerprints")
+
+    def put_fingerprints(
+        self, fingerprints: t.Iterable[t.Tuple[str, SnapshotFingerprint]]
+    ) -> None:
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT OR REPLACE INTO model_fingerprints(
+                    fqn, data_hash, metadata_hash, parent_data_hash, parent_metadata_hash
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        name,
+                        fingerprint.data_hash,
+                        fingerprint.metadata_hash,
+                        fingerprint.parent_data_hash,
+                        fingerprint.parent_metadata_hash,
+                    )
+                    for name, fingerprint in fingerprints
+                ),
+            )
+
+    def fingerprint(self, name: str) -> SnapshotFingerprint:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM model_fingerprints WHERE fqn = ?", (name,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(name)
+        return SnapshotFingerprint(
+            data_hash=row["data_hash"],
+            metadata_hash=row["metadata_hash"],
+            parent_data_hash=row["parent_data_hash"],
+            parent_metadata_hash=row["parent_metadata_hash"],
+        )
+
     @staticmethod
     def _row_to_metadata(row: sqlite3.Row) -> ModelMetadata:
         dependencies = row["dependencies"]
@@ -191,4 +343,6 @@ class ProjectGraphIndex:
             dependencies=tuple(sorted(dependencies.split(chr(31)))) if dependencies else (),
             tags=tuple(json.loads(row["tags"])),
             dbt_fqn=row["dbt_fqn"],
+            payload_key=row["payload_key"],
+            payload_digest=row["payload_digest"],
         )

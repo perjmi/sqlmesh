@@ -1,10 +1,12 @@
 from pathlib import Path
 
+import pytest
 from sqlglot import parse_one
 
 from sqlmesh.core.model import create_sql_model
 from sqlmesh.core.model.registry import EagerModelRegistry, ModelMetadata
-from sqlmesh.core.selector import MetadataSelector, NativeSelector
+from sqlmesh.core.selector import MetadataSelector, NativeSelector, ShadowSelector
+from sqlmesh.utils.errors import SQLMeshError
 
 
 def test_eager_registry_exposes_deterministic_metadata_and_graph_queries():
@@ -46,6 +48,8 @@ def test_eager_registry_exposes_deterministic_metadata_and_graph_queries():
         dependencies=(model_b.fqn,),
         tags=("daily",),
         dbt_fqn=None,
+        payload_key=model_c.fqn,
+        payload_digest=f"{model_c.data_hash}_{model_c.metadata_hash}",
     )
     assert registry.upstream({model_c.fqn}) == {model_a.fqn, model_b.fqn}
     assert registry.downstream({model_a.fqn}) == {model_b.fqn, model_c.fqn}
@@ -101,3 +105,18 @@ def test_metadata_selector_matches_eager_native_selection():
     assert selected == {'"model2"'}
     assert upstream == {'"model1"'}
     assert downstream == {'"model3"'}
+
+
+def test_shadow_selector_fails_on_metadata_selection_mismatch():
+    model = create_sql_model("model", parse_one("SELECT 1"))
+    registry = EagerModelRegistry({model.fqn: model})
+    eager = NativeSelector(object(), registry)
+
+    class IncorrectMetadataSelector:
+        def expand_model_selections(self, model_selections):
+            return set()
+
+    selector = ShadowSelector(eager, IncorrectMetadataSelector(), {model.fqn})
+
+    with pytest.raises(SQLMeshError, match="metadata selection mismatch"):
+        selector.expand_model_selections(["model"])
