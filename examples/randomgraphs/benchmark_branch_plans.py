@@ -19,7 +19,7 @@ from generate_model_graph import generate_model_graph
 
 PROJECT_PATH = Path(__file__).parent
 RESULT_MARKER = "RANDOMGRAPH_BENCHMARK_RESULT="
-DEFAULT_WIDTHS = (10, 100, 200, 500)
+DEFAULT_WIDTHS = (10, 100, 200, 500, 1000)
 COMPOSE = (
     "docker",
     "compose",

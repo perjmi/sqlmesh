@@ -15,6 +15,7 @@ Values are the sample mean ± sample standard deviation. Peak memory is aggregat
 | 100 | 700 | 18.17 ± 0.56 | 34.70 ± 1.38 | +91.0% | 423.5 ± 1.9 | 299.0 ± 1.0 | 29.4% |
 | 200 | 1,400 | 34.08 ± 0.49 | 66.98 ± 1.08 | +96.6% | 701.1 ± 2.5 | 444.7 ± 1.2 | 36.6% |
 | 500 | 3,500 | 92.61 ± 3.35 | 173.34 ± 6.82 | +87.2% | 1,519.3 ± 4.5 | 879.5 ± 2.3 | 42.1% |
+| 1,000 | 7,000 | 223.26 ± 5.90 | 379.04 ± 7.00 | +69.8% | 2,879.7 ± 4.8 | 1,640.7 ± 3.4 | 43.0% |
 
 Distribution details:
 
@@ -28,6 +29,8 @@ Distribution details:
 | 200 | streaming | 66.71 | 68.76 | 444.7 | 446.3 |
 | 500 | main | 91.62 | 98.47 | 1,520.3 | 1,523.7 |
 | 500 | streaming | 170.88 | 184.49 | 880.1 | 881.8 |
+| 1,000 | main | 223.85 | 230.40 | 2,879.4 | 2,887.1 |
+| 1,000 | streaming | 381.37 | 386.33 | 1,640.0 | 1,645.8 |
 
 ## Method
 
@@ -43,8 +46,8 @@ Distribution details:
 
 ## Interpretation
 
-The streaming implementation trades planning time for memory. At 3,500 models it reduces aggregate
-peak RSS by 42.1% (about 640 MiB), while taking 87.2% longer.
+The streaming implementation trades planning time for memory. At 7,000 models it reduces aggregate
+peak RSS by 43.0% (about 1,239 MiB), while taking 69.8% longer.
 
 Total full-plan memory is not yet bounded independently of project size. This branch bounds native
 local-project model hydration, edge traversal, and schema-column propagation, but the completed plan
