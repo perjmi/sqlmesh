@@ -3,6 +3,7 @@ from pathlib import Path
 from sqlmesh.cli.project_init import init_example_project
 from sqlmesh.core.config import Config, ModelDefaultsConfig
 from sqlmesh.core.context import Context
+from sqlmesh.core.loader import SqlMeshLoader
 from sqlmesh.utils.errors import ConfigError
 
 
@@ -201,3 +202,35 @@ def my_model(context, **kwargs):
     assert model.description == "model_payload_a"
     path_b.write_text(model_payload_b)
     context.load()  # raise no error to duplicate key if the functions are identical (by registry class_method)
+
+
+def test_sql_models_are_discovered_in_source_file_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each SQL source should be releasable before the next source is retained."""
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    for index in range(3):
+        (models_dir / f"model_{index}.sql").write_text(
+            f"MODEL (name test.model_{index}, kind FULL); SELECT {index} AS id"
+        )
+
+    discovered_batches = []
+    original = SqlMeshLoader._iter_sql_model_batches
+
+    def track_batches(self, *args, **kwargs):
+        for batch in original(self, *args, **kwargs):
+            discovered_batches.append(tuple(model.fqn for model in batch))
+            yield batch
+
+    monkeypatch.setattr(SqlMeshLoader, "_iter_sql_model_batches", track_batches)
+
+    context = Context(
+        paths=tmp_path,
+        config=Config(model_defaults=ModelDefaultsConfig(dialect="duckdb")),
+        load_state=False,
+    )
+
+    assert len(discovered_batches) == 3
+    assert all(len(batch) == 1 for batch in discovered_batches)
+    assert {name for batch in discovered_batches for name in batch} == set(context.models)

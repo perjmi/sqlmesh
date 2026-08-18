@@ -562,6 +562,39 @@ class SqlMeshLoader(Loader):
     ) -> UniqueKeyDict[str, Model]:
         """Loads the sql models into a Dict"""
         models: UniqueKeyDict[str, Model] = UniqueKeyDict("models")
+
+        for loaded_models in self._iter_sql_model_batches(
+            macros, jinja_macros, audits, signals, cache, gateway
+        ):
+            for model in loaded_models:
+                if model.fqn in models:
+                    path = model._path or self.config_path
+                    raise ConfigError(
+                        self._failed_to_load_model_error(
+                            path, f"Duplicate SQL model name: '{model.name}'."
+                        ),
+                        path,
+                    )
+                if model.enabled:
+                    models[model.fqn] = model
+
+        return models
+
+    def _iter_sql_model_batches(
+        self,
+        macros: MacroRegistry,
+        jinja_macros: JinjaMacroRegistry,
+        audits: UniqueKeyDict[str, ModelAudit],
+        signals: UniqueKeyDict[str, signal],
+        cache: CacheBase,
+        gateway: t.Optional[str],
+    ) -> t.Iterator[t.Tuple[Model, ...]]:
+        """Yields SQL models one source file at a time.
+
+        Keeping source-file results as the ownership boundary lets indexed loaders persist a
+        batch and release its hydrated model objects before consuming the next file. A source file
+        may define more than one model, so its model count is the minimum possible batch size.
+        """
         paths: t.Set[Path] = set()
         cached_paths: UniqueKeyDict[Path, t.List[Model]] = UniqueKeyDict("cached_paths")
 
@@ -580,9 +613,7 @@ class SqlMeshLoader(Loader):
 
         for path, cached_models in cached_paths.items():
             paths.remove(path)
-            for model in cached_models:
-                if model.enabled:
-                    models[model.fqn] = model
+            yield tuple(cached_models)
 
         if paths:
             model_loading_defaults = dict(
@@ -619,21 +650,12 @@ class SqlMeshLoader(Loader):
                     path = futures_to_paths[future]
                     try:
                         loaded = future.result()
-                        for model in loaded or cache.get(path):
-                            if model.fqn in models:
-                                raise ConfigError(
-                                    self._failed_to_load_model_error(
-                                        path, f"Duplicate SQL model name: '{model.name}'."
-                                    ),
-                                    path,
-                                )
-                            elif model.enabled:
-                                model._path = path
-                                models[model.fqn] = model
+                        models = loaded or cache.get(path)
+                        for model in models:
+                            model._path = path
+                        yield tuple(models)
                     except Exception as ex:
                         raise ConfigError(self._failed_to_load_model_error(path, ex), path)
-
-        return models
 
     def _load_python_models(
         self,
