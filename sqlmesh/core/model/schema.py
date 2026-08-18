@@ -4,6 +4,7 @@ import typing as t
 from concurrent.futures import as_completed
 from pathlib import Path
 
+from sqlglot import exp
 from sqlglot.errors import SchemaError
 from sqlglot.schema import MappingSchema
 
@@ -45,9 +46,9 @@ def update_model_schemas_streaming(
     are the semantic input needed by query optimization, are copied into a compact mapping before
     the parent payload is released. Returns the maximum simultaneously hydrated model count.
     """
-    schema = MappingSchema(normalize=False)
     optimized_query_cache = OptimizedQueryCache(cache_dir)
     max_hydrated_models = 0
+    expected_nesting_level: t.Optional[int] = None
 
     with optimized_query_cache_pool(optimized_query_cache) as executor:
         for names in index.iter_topological_batches(batch_size):
@@ -84,7 +85,21 @@ def update_model_schemas_streaming(
                     if model.mapping_schema != mapping_schema:
                         model.set_mapping_schema(mapping_schema)
                     optimized_query_cache.with_optimized_query(model, entry_name)
-                    _update_schema_with_model(schema, model)
+                    if model.columns_to_types:
+                        nesting_level = len(exp.to_table(model.fqn, dialect=model.dialect).parts)
+                        if expected_nesting_level is None:
+                            expected_nesting_level = nesting_level
+                        elif nesting_level != expected_nesting_level:
+                            from sqlmesh.core.console import get_console
+
+                            get_console().log_error(
+                                "SQLMesh requires all model names and references to have the same "
+                                "level of nesting."
+                            )
+                            raise SchemaError(
+                                f"Model '{model.fqn}' has nesting level {nesting_level}; expected "
+                                f"{expected_nesting_level}"
+                            )
                     model.validate_definition()
                 except Exception as ex:
                     raise SchemaError(f"Failed to update model schemas\n\n{ex}")

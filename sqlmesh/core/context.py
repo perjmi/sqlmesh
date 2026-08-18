@@ -92,7 +92,7 @@ from sqlmesh.core.model.registry import (
     ModelMetadata,
     ModelPayloadStore,
 )
-from sqlmesh.core.model.graph import ProjectGraphIndex
+from sqlmesh.core.model.graph import IndexedDAG, ProjectGraphIndex
 from sqlmesh.core.config.model import ModelDefaultsConfig
 from sqlmesh.core.notification_target import (
     NotificationEvent,
@@ -772,11 +772,9 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         if self.config.planner.mode == PlannerMode.STREAMING:
             assert self._model_graph_index is not None
-            for metadata_batch in self._model_graph_index.iter_metadata_batches(
-                self.config.planner.model_batch_size
-            ):
-                for metadata in metadata_batch:
-                    self.dag.add(metadata.fqn, metadata.dependencies)
+            self.dag = IndexedDAG(
+                self._model_graph_index, batch_size=self.config.planner.model_batch_size
+            )
         else:
             for model in self._models.values():
                 self.dag.add(model.fqn, model.depends_on)
@@ -816,13 +814,15 @@ class GenericContext(BaseContext, t.Generic[C]):
                     # The model definition can be validated correctly only after the schema is set.
                     model.validate_definition()
 
-        local_model_names = (
-            set(self._model_graph_index.iter_names())
-            if self.config.planner.mode == PlannerMode.STREAMING
-            and self._model_graph_index is not None
-            else set(self._models)
-        )
-        duplicates = local_model_names & set(self._standalone_audits)
+        if self.config.planner.mode == PlannerMode.STREAMING:
+            assert self._model_graph_index is not None
+            duplicates = {
+                name for name in self._standalone_audits if self._model_graph_index.contains(name)
+            }
+            models_count = self._model_graph_index.model_count()
+        else:
+            duplicates = set(self._models) & set(self._standalone_audits)
+            models_count = len(self._models)
         if duplicates:
             raise ConfigError(
                 f"Models and Standalone audits cannot have the same name: {duplicates}"
@@ -844,7 +844,7 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         analytics.collector.on_project_loaded(
             project_type=self._project_type,
-            models_count=len(local_model_names),
+            models_count=models_count,
             audits_count=len(self._audits),
             standalone_audits_count=len(self._standalone_audits),
             macros_count=len(self._macros),

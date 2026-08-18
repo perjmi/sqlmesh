@@ -5,7 +5,7 @@ import pytest
 from sqlglot import parse_one
 
 from sqlmesh.core.model import create_sql_model
-from sqlmesh.core.model.graph import ProjectGraphIndex
+from sqlmesh.core.model.graph import IndexedDAG, ProjectGraphIndex
 from sqlmesh.core.model.registry import IndexedModelRegistry, ModelMetadata, ModelPayloadStore
 from sqlmesh.core.model.schema import update_model_schemas_streaming
 from sqlmesh.core.selector import MetadataSelector
@@ -14,6 +14,7 @@ from sqlmesh.core.snapshot.streaming import StreamingFingerprinter
 from sqlmesh.core.context_diff_streaming import CompactContextDiff
 from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory
 from sqlmesh.utils.errors import SQLMeshError
+from sqlmesh.utils.dag import DAG
 
 
 def _metadata(
@@ -142,7 +143,7 @@ def test_model_payload_store_round_trips_models_by_metadata_digest(tmp_path):
     assert store.get(_metadata("missing")) is None
 
 
-def test_streaming_schema_propagation_hydrates_only_child_and_one_parent(tmp_path):
+def test_streaming_schema_propagation_hydrates_only_child_and_one_parent(tmp_path, monkeypatch):
     model_a = create_sql_model("db.a", parse_one("SELECT 1 AS id"))
     model_b = create_sql_model("db.b", parse_one("SELECT * FROM db.a"), depends_on={model_a.fqn})
     index = ProjectGraphIndex(tmp_path / "graph.sqlite")
@@ -155,6 +156,12 @@ def test_streaming_schema_propagation_hydrates_only_child_and_one_parent(tmp_pat
     for model, metadata in zip((model_a, model_b), discovered):
         store.put_discovered(model, metadata)
 
+    def fail_if_global_schema_is_updated(*args, **kwargs):
+        raise AssertionError("streaming propagation must not accumulate a project-wide schema")
+
+    monkeypatch.setattr(
+        "sqlmesh.core.model.schema._update_schema_with_model", fail_if_global_schema_is_updated
+    )
     max_hydrated = update_model_schemas_streaming(index, store, cache_dir=tmp_path, batch_size=1)
 
     assert max_hydrated == 2
@@ -219,6 +226,46 @@ def test_topological_batches_reject_cycles(tmp_path):
 
     with pytest.raises(SQLMeshError, match="cycle"):
         list(index.iter_topological_batches(batch_size=1))
+
+
+def test_topological_batches_do_not_enumerate_graph_into_python(tmp_path, monkeypatch):
+    index = ProjectGraphIndex(tmp_path / "graph.sqlite")
+    index.replace([_metadata("c", "a", "b"), _metadata("a"), _metadata("b", "a")])
+
+    def fail_if_names_are_enumerated():
+        raise AssertionError("topological traversal must keep graph-wide state in SQLite")
+
+    monkeypatch.setattr(index, "iter_names", fail_if_names_are_enumerated)
+
+    assert list(index.iter_topological_batches(batch_size=1)) == [("a",), ("b",), ("c",)]
+
+
+def test_indexed_dag_matches_read_only_dag_api(tmp_path):
+    records = [
+        _metadata("c", "a", "b", "external"),
+        _metadata("a"),
+        _metadata("b"),
+    ]
+    index = ProjectGraphIndex(tmp_path / "graph.sqlite")
+    index.replace(records)
+    indexed = IndexedDAG(index, batch_size=1)
+    eager = DAG({record.fqn: set(record.dependencies) for record in records})
+
+    assert indexed.graph == eager.graph
+    assert indexed.sorted == eager.sorted
+    assert list(indexed) == eager.sorted
+    assert indexed.roots == eager.roots
+    assert indexed.upstream("c") == eager.upstream("c")
+    assert indexed.downstream("external") == eager.downstream("external")
+    assert indexed.prune("c", "external").graph == eager.prune("c", "external").graph
+    assert indexed.subdag("c").graph == eager.subdag("c").graph
+    assert indexed.lineage("a").graph == eager.lineage("a").graph
+    assert indexed.reversed.graph == eager.reversed.graph
+    assert "external" in indexed
+    assert "missing" not in indexed
+
+    with pytest.raises(SQLMeshError, match="project reload"):
+        indexed.add("new")
 
 
 def test_compact_context_diff_matches_fingerprints_without_snapshot_payloads(tmp_path):

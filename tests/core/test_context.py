@@ -2617,6 +2617,7 @@ def test_eager_planner_does_not_create_model_graph_index(tmp_path):
 
 
 def test_streaming_planner_releases_eager_models_after_load(tmp_path):
+    from sqlmesh.core.model.graph import IndexedDAG
     from sqlmesh.core.model.registry import IndexedModelMapping
 
     models_path = tmp_path / "models"
@@ -2636,6 +2637,8 @@ def test_streaming_planner_releases_eager_models_after_load(tmp_path):
     )
 
     assert isinstance(context._models, IndexedModelMapping)
+    assert isinstance(context.dag, IndexedDAG)
+    assert context.dag._dag == {}
     assert context.indexed_model_registry is not None
     assert context.model_graph_index is not None
     assert context.model_discovery_max_batch_size == 1
@@ -2647,6 +2650,9 @@ def test_streaming_planner_releases_eager_models_after_load(tmp_path):
     assert model_a is not None
     assert model_a.name == "db.a"
     assert context.indexed_model_registry.cache_size == 1
+    model_b = context.get_model("db.b")
+    assert model_b is not None
+    assert context.dag.upstream(model_b.fqn) == {model_a.fqn}
 
     plan = context.plan_builder("dev", skip_tests=True, skip_backfill=True).build()
     assert {snapshot.name for snapshot in plan.new_snapshots} == set(context.models)
