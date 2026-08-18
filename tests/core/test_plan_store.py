@@ -1,6 +1,8 @@
 from sqlglot import parse_one
 
+from sqlmesh.core.context_diff import ContextDiff
 from sqlmesh.core.model import SqlModel
+from sqlmesh.core.plan import PlanBuilder
 from sqlmesh.core.plan.store import SnapshotPlanStore
 from sqlmesh.core.snapshot import SnapshotChangeCategory
 
@@ -93,3 +95,40 @@ def test_snapshot_plan_store_traverses_snapshot_edges_in_topological_batches(
         snapshot_b.snapshot_id,
         snapshot_c.snapshot_id,
     }
+
+
+def test_streaming_plan_keeps_modified_snapshot_and_catalog_mutations_in_sync(
+    tmp_path, make_snapshot
+):
+    old = make_snapshot(SqlModel(name="a", query=parse_one("SELECT 1 AS value")))
+    old.categorize_as(SnapshotChangeCategory.BREAKING)
+    new = make_snapshot(SqlModel(name="a", query=parse_one("SELECT 2 AS value")))
+    store = SnapshotPlanStore(tmp_path / "plan.sqlite", max_cached_snapshots=1, write_batch_size=1)
+    store.put_snapshot(new, is_new=True)
+    context_diff = ContextDiff(
+        environment="prod",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        create_from="prod",
+        create_from_env_exists=False,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={new.name: (new, old)},
+        snapshots=store.snapshots,
+        new_snapshots=store.new_snapshots,
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        environment_statements=[],
+    )
+
+    plan = PlanBuilder(context_diff, skip_backfill=True).build()
+    stored = plan.context_diff.snapshots[new.snapshot_id]
+    modified = plan.context_diff.modified_snapshots[new.name][0]
+
+    assert stored.categorized
+    assert modified.change_category == stored.change_category
+    assert modified.version == stored.version

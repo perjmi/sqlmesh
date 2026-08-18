@@ -788,21 +788,21 @@ class PlanBuilder:
         for new, old in self._context_diff.modified_snapshots.values():
             if not new.is_model or not old.is_model:
                 continue
+            current = self._context_diff.snapshots[new.snapshot_id]
             is_same_version = old.version_get_or_generate() == new.version_get_or_generate()
             if is_same_version and should_force_rebuild(old, new):
                 # If the difference between 2 snapshots requires a full rebuild,
                 # then clear the intervals for the new snapshot.
-                current = self._context_diff.snapshots[new.snapshot_id]
                 current.intervals = []
                 self._save_streaming_snapshot(current)
-            elif new.snapshot_id in self._context_diff.new_snapshots:
-                new.intervals = []
-                new.dev_intervals = []
+            elif current.snapshot_id in self._context_diff.new_snapshots:
+                current.intervals = []
+                current.dev_intervals = []
                 if is_same_version:
-                    new.merge_intervals(old)
-                    if new.is_forward_only:
-                        new.dev_intervals = new.intervals.copy()
-                self._save_streaming_snapshot(new)
+                    current.merge_intervals(old)
+                    if current.is_forward_only:
+                        current.dev_intervals = current.intervals.copy()
+                self._save_streaming_snapshot(current)
 
     def _check_destructive_additive_changes(self, directly_modified: t.Set[SnapshotId]) -> None:
         for s_id in sorted(directly_modified):
@@ -899,6 +899,9 @@ class PlanBuilder:
                 snapshot.categorize_as(SnapshotChangeCategory.BREAKING, forward_only)
             elif s_id.name in self._context_diff.modified_snapshots:
                 self._categorize_snapshot(snapshot, forward_only, dag, indirectly_modified)
+                if isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
+                    _, old = self._context_diff.modified_snapshots[s_id.name]
+                    self._context_diff.modified_snapshots[s_id.name] = (snapshot, old)
             self._save_streaming_snapshot(snapshot)
 
     def _categorize_snapshot(
