@@ -180,6 +180,8 @@ class Loader(abc.ABC):
         self.config = self.context.configs[self.config_path]
         self._variables_by_gateway: t.Dict[str, t.Dict[str, t.Any]] = {}
         self._model_batch_consumer: t.Optional[t.Callable[[t.Tuple[Model, ...]], None]] = None
+        self._retain_model_batches = True
+        self._discovered_model_names: t.Set[str] = set()
         self._console = get_console()
 
         self.config_essentials = {
@@ -190,15 +192,20 @@ class Loader(abc.ABC):
         _init_model_defaults(self.config_essentials, self.context.selected_gateway)
 
     def set_model_batch_consumer(
-        self, consumer: t.Optional[t.Callable[[t.Tuple[Model, ...]], None]]
+        self,
+        consumer: t.Optional[t.Callable[[t.Tuple[Model, ...]], None]],
+        *,
+        retain_models: bool = True,
     ) -> None:
         """Sets a context-owned consumer for models discovered during the next load."""
         self._model_batch_consumer = consumer
+        self._retain_model_batches = retain_models
 
     def _emit_model_batch(self, models: t.Iterable[Model]) -> None:
         if self._model_batch_consumer is not None:
             batch = tuple(models)
             if batch:
+                self._discovered_model_names.update(model.fqn for model in batch)
                 self._model_batch_consumer(batch)
 
     def load(self) -> LoadedProject:
@@ -208,6 +215,7 @@ class Loader(abc.ABC):
         Returns:
             A loaded project object.
         """
+        self._discovered_model_names.clear()
         with sys_path(self.config_path):
             # python files are cached by the system
             # need to manually clear here so we can reload macros
@@ -553,11 +561,42 @@ class SqlMeshLoader(Loader):
         """
         cache = SqlMeshLoader._Cache(self, self.config_path)
 
+        if not self._retain_model_batches:
+            python_model_path = next(
+                (
+                    path
+                    for path in self._glob_paths(
+                        self.config_path / c.MODELS,
+                        ignore_patterns=self.config.ignore_patterns,
+                        extension=".py",
+                    )
+                    if os.path.getsize(path)
+                ),
+                None,
+            )
+            external_model_files = (
+                self.config_path / c.EXTERNAL_MODELS_YAML,
+                self.config_path / c.EXTERNAL_MODELS_DEPRECATED_YAML,
+            )
+            external_models_path = self.config_path / c.EXTERNAL_MODELS
+            has_external_models = any(
+                path.is_file() and os.path.getsize(path) for path in external_model_files
+            ) or (external_models_path.is_dir() and any(external_models_path.glob("**/*.yaml")))
+            if python_model_path is not None or has_external_models:
+                raise ConfigError(
+                    "Bounded streaming loading currently supports native SQL models only. "
+                    "Use planner mode 'shadow' for projects with Python or external models."
+                )
+
         sql_models = self._load_sql_models(macros, jinja_macros, audits, signals, cache, gateway)
         external_models = self._load_external_models(audits, cache, gateway)
         python_models = self._load_python_models(macros, jinja_macros, audits, signals)
 
-        all_model_names = list(sql_models) + list(external_models) + list(python_models)
+        all_model_names = (
+            list(sql_models or self._discovered_model_names)
+            + list(external_models)
+            + list(python_models)
+        )
         duplicates = [name for name, count in Counter(all_model_names).items() if count > 1]
         if duplicates:
             raise ConfigError(f"Duplicate model name(s) found: {', '.join(duplicates)}.")
@@ -565,6 +604,8 @@ class SqlMeshLoader(Loader):
         self._emit_model_batch(external_models.values())
         self._emit_model_batch(python_models.values())
 
+        if not self._retain_model_batches:
+            return UniqueKeyDict("models")
         return UniqueKeyDict("models", **sql_models, **external_models, **python_models)
 
     def _load_sql_models(
@@ -578,13 +619,14 @@ class SqlMeshLoader(Loader):
     ) -> UniqueKeyDict[str, Model]:
         """Loads the sql models into a Dict"""
         models: UniqueKeyDict[str, Model] = UniqueKeyDict("models")
+        discovered_names: t.Set[str] = set()
 
         for loaded_models in self._iter_sql_model_batches(
             macros, jinja_macros, audits, signals, cache, gateway
         ):
             enabled_models = []
             for model in loaded_models:
-                if model.fqn in models:
+                if model.fqn in discovered_names:
                     path = model._path or self.config_path
                     raise ConfigError(
                         self._failed_to_load_model_error(
@@ -593,7 +635,9 @@ class SqlMeshLoader(Loader):
                         path,
                     )
                 if model.enabled:
-                    models[model.fqn] = model
+                    discovered_names.add(model.fqn)
+                    if self._retain_model_batches:
+                        models[model.fqn] = model
                     enabled_models.append(model)
             self._emit_model_batch(enabled_models)
 
@@ -615,7 +659,6 @@ class SqlMeshLoader(Loader):
         may define more than one model, so its model count is the minimum possible batch size.
         """
         paths: t.Set[Path] = set()
-        cached_paths: UniqueKeyDict[Path, t.List[Model]] = UniqueKeyDict("cached_paths")
 
         for path in self._glob_paths(
             self.config_path / c.MODELS,
@@ -626,13 +669,10 @@ class SqlMeshLoader(Loader):
                 continue
 
             self._track_file(path)
-            paths.add(path)
             if cached_models := cache.get(path):
-                cached_paths[path] = cached_models
-
-        for path, cached_models in cached_paths.items():
-            paths.remove(path)
-            yield tuple(cached_models)
+                yield tuple(cached_models)
+            else:
+                paths.add(path)
 
         if paths:
             model_loading_defaults = dict(
@@ -666,7 +706,7 @@ class SqlMeshLoader(Loader):
             ) as pool:
                 futures_to_paths = {pool.submit(load_sql_models, path): path for path in paths}
                 for future in concurrent.futures.as_completed(futures_to_paths):
-                    path = futures_to_paths[future]
+                    path = futures_to_paths.pop(future)
                     try:
                         loaded = future.result()
                         models = loaded or cache.get(path)

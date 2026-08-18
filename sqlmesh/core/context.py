@@ -84,6 +84,7 @@ from sqlmesh.core.linter.rules import BUILTIN_RULES
 from sqlmesh.core.macros import ExecutableOrMacro, macro
 from sqlmesh.core.metric import Metric, rewrite
 from sqlmesh.core.model import Model, update_model_schemas
+from sqlmesh.core.model.schema import update_model_schemas_streaming
 from sqlmesh.core.model.registry import (
     EagerModelRegistry,
     IndexedModelMapping,
@@ -434,6 +435,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._indexed_model_registry: t.Optional[IndexedModelRegistry] = None
         self._compact_context_diff: t.Optional[CompactContextDiff] = None
         self._model_discovery_max_batch_size = 0
+        self._model_schema_max_hydrated = 0
 
         self.path, self.config = t.cast(t.Tuple[Path, C], next(iter(self.configs.items())))
 
@@ -664,10 +666,12 @@ class GenericContext(BaseContext, t.Generic[C]):
         load_start_ts = time.perf_counter()
 
         self._model_discovery_max_batch_size = 0
+        self._model_schema_max_hydrated = 0
         if self.config.planner.mode == PlannerMode.EAGER:
             loaded_projects = [loader.load() for loader in self._loaders]
         else:
             discovery_index = ProjectGraphIndex(self.cache_dir / "model_graph.sqlite")
+            discovery_payload_store = ModelPayloadStore(self.cache_dir)
             with discovery_index.replacing() as writer:
 
                 def persist_model_batch(models: t.Tuple[Model, ...]) -> None:
@@ -676,10 +680,15 @@ class GenericContext(BaseContext, t.Generic[C]):
                     )
                     for model in models:
                         metadata = ModelMetadata.from_model(model, include_payload_digest=False)
+                        if self.config.planner.mode == PlannerMode.STREAMING:
+                            discovery_payload_store.put_discovered(model, metadata)
                         writer.add(metadata)
 
                 for loader in self._loaders:
-                    loader.set_model_batch_consumer(persist_model_batch)
+                    loader.set_model_batch_consumer(
+                        persist_model_batch,
+                        retain_models=self.config.planner.mode != PlannerMode.STREAMING,
+                    )
                 try:
                     loaded_projects = [loader.load() for loader in self._loaders]
                 finally:
@@ -761,50 +770,81 @@ class GenericContext(BaseContext, t.Generic[C]):
                         else:
                             local_store[snapshot.name] = snapshot.node  # type: ignore
 
-        for model in self._models.values():
-            self.dag.add(model.fqn, model.depends_on)
+        if self.config.planner.mode == PlannerMode.STREAMING:
+            assert self._model_graph_index is not None
+            for metadata_batch in self._model_graph_index.iter_metadata_batches(
+                self.config.planner.model_batch_size
+            ):
+                for metadata in metadata_batch:
+                    self.dag.add(metadata.fqn, metadata.dependencies)
+        else:
+            for model in self._models.values():
+                self.dag.add(model.fqn, model.depends_on)
 
         if update_schemas:
-            for fqn in self.dag:
-                model = self._models.get(fqn)  # type: ignore
+            if self.config.planner.mode == PlannerMode.STREAMING:
+                assert self._model_graph_index is not None
+                self._model_schema_max_hydrated = update_model_schemas_streaming(
+                    self._model_graph_index,
+                    ModelPayloadStore(self.cache_dir),
+                    cache_dir=self.cache_dir,
+                    batch_size=self.config.planner.model_batch_size,
+                )
+            else:
+                for fqn in self.dag:
+                    model = self._models.get(fqn)  # type: ignore
 
-                if not model or fqn in uncached:
-                    continue
+                    if not model or fqn in uncached:
+                        continue
 
-                # make a copy of remote models that depend on local models or in the downstream chain
-                # without this, a SELECT * FROM local will not propogate properly because the downstream
-                # model will get mutated (schema changes) but the object is the same as the remote cache
-                if any(dep in uncached for dep in model.depends_on):
-                    uncached.add(fqn)
-                    self._models.update({fqn: model.copy(update={"mapping_schema": {}})})
-                    continue
+                    # make a copy of remote models that depend on local models or in the downstream chain
+                    # without this, a SELECT * FROM local will not propogate properly because the downstream
+                    # model will get mutated (schema changes) but the object is the same as the remote cache
+                    if any(dep in uncached for dep in model.depends_on):
+                        uncached.add(fqn)
+                        self._models.update({fqn: model.copy(update={"mapping_schema": {}})})
+                        continue
 
-            update_model_schemas(
-                self.dag,
-                models=self._models,
-                cache_dir=self.cache_dir,
-            )
+                update_model_schemas(
+                    self.dag,
+                    models=self._models,
+                    cache_dir=self.cache_dir,
+                )
 
-            models = self.models.values()
-            for model in models:
-                # The model definition can be validated correctly only after the schema is set.
-                model.validate_definition()
+                models = self.models.values()
+                for model in models:
+                    # The model definition can be validated correctly only after the schema is set.
+                    model.validate_definition()
 
-        duplicates = set(self._models) & set(self._standalone_audits)
+        local_model_names = (
+            set(self._model_graph_index.iter_names())
+            if self.config.planner.mode == PlannerMode.STREAMING
+            and self._model_graph_index is not None
+            else set(self._models)
+        )
+        duplicates = local_model_names & set(self._standalone_audits)
         if duplicates:
             raise ConfigError(
                 f"Models and Standalone audits cannot have the same name: {duplicates}"
             )
 
-        self._all_dialects = {m.dialect for m in self._models.values() if m.dialect} | {
-            self.default_dialect or ""
-        }
+        if self.config.planner.mode == PlannerMode.STREAMING:
+            assert self._model_graph_index is not None
+            self._all_dialects = {
+                metadata.dialect
+                for metadata in self._model_graph_index.iter_metadata()
+                if metadata.dialect
+            } | {self.default_dialect or ""}
+        else:
+            self._all_dialects = {m.dialect for m in self._models.values() if m.dialect} | {
+                self.default_dialect or ""
+            }
 
         self._refresh_model_graph_index()
 
         analytics.collector.on_project_loaded(
             project_type=self._project_type,
-            models_count=len(self._models),
+            models_count=len(local_model_names),
             audits_count=len(self._audits),
             standalone_audits_count=len(self._standalone_audits),
             macros_count=len(self._macros),
@@ -817,7 +857,9 @@ class GenericContext(BaseContext, t.Generic[C]):
         if self.config.planner.mode == PlannerMode.STREAMING:
             if self._indexed_model_registry is None:
                 raise SQLMeshError("Streaming model registry was not initialized")
+            compatibility_overrides = dict(self._models)
             self._models = IndexedModelMapping(self._indexed_model_registry)
+            self._models.update(compatibility_overrides)
 
         self._loaded = True
         return self
@@ -1160,6 +1202,11 @@ class GenericContext(BaseContext, t.Generic[C]):
         return self._model_discovery_max_batch_size
 
     @property
+    def model_schema_max_hydrated(self) -> int:
+        """Maximum model objects simultaneously hydrated by streaming schema propagation."""
+        return self._model_schema_max_hydrated
+
+    @property
     def compact_context_diff(self) -> t.Optional[CompactContextDiff]:
         """Returns the most recent payload-free shadow context diff, if one was built."""
         return self._compact_context_diff
@@ -1172,36 +1219,37 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         index = ProjectGraphIndex(self.cache_dir / "model_graph.sqlite")
         payload_store = ModelPayloadStore(self.cache_dir)
-        if index.model_count() != len(self._models):
-            raise SQLMeshError(
-                "The incrementally discovered model graph does not match the loaded project size"
-            )
+        if self.config.planner.mode == PlannerMode.SHADOW:
+            if index.model_count() != len(self._models):
+                raise SQLMeshError(
+                    "The incrementally discovered model graph does not match the loaded project size"
+                )
 
-        eager_metadata_iterator = self._models.iter_metadata()
-        for indexed_batch in index.iter_metadata_batches(self.config.planner.model_batch_size):
-            final_metadata_batch = []
-            for indexed_metadata in indexed_batch:
-                eager_metadata = next(eager_metadata_iterator)
-                if (
-                    indexed_metadata.fqn != eager_metadata.fqn
-                    or indexed_metadata.name != eager_metadata.name
-                    or indexed_metadata.source_path != eager_metadata.source_path
-                    or indexed_metadata.project != eager_metadata.project
-                    or indexed_metadata.dialect != eager_metadata.dialect
-                    or indexed_metadata.gateway != eager_metadata.gateway
-                    or indexed_metadata.enabled != eager_metadata.enabled
-                    or indexed_metadata.kind_name != eager_metadata.kind_name
-                    or indexed_metadata.dependencies != eager_metadata.dependencies
-                    or indexed_metadata.tags != eager_metadata.tags
-                    or indexed_metadata.dbt_fqn != eager_metadata.dbt_fqn
-                ):
-                    raise SQLMeshError(
-                        f"Incremental discovery metadata for '{eager_metadata.fqn}' does not "
-                        "match the loaded project"
-                    )
-                payload_store.put(self._models[eager_metadata.fqn], eager_metadata)
-                final_metadata_batch.append(eager_metadata)
-            index.update_payload_references(final_metadata_batch)
+            eager_metadata_iterator = self._models.iter_metadata()
+            for indexed_batch in index.iter_metadata_batches(self.config.planner.model_batch_size):
+                final_metadata_batch = []
+                for indexed_metadata in indexed_batch:
+                    eager_metadata = next(eager_metadata_iterator)
+                    if (
+                        indexed_metadata.fqn != eager_metadata.fqn
+                        or indexed_metadata.name != eager_metadata.name
+                        or indexed_metadata.source_path != eager_metadata.source_path
+                        or indexed_metadata.project != eager_metadata.project
+                        or indexed_metadata.dialect != eager_metadata.dialect
+                        or indexed_metadata.gateway != eager_metadata.gateway
+                        or indexed_metadata.enabled != eager_metadata.enabled
+                        or indexed_metadata.kind_name != eager_metadata.kind_name
+                        or indexed_metadata.dependencies != eager_metadata.dependencies
+                        or indexed_metadata.tags != eager_metadata.tags
+                        or indexed_metadata.dbt_fqn != eager_metadata.dbt_fqn
+                    ):
+                        raise SQLMeshError(
+                            f"Incremental discovery metadata for '{eager_metadata.fqn}' does not "
+                            "match the loaded project"
+                        )
+                    payload_store.put(self._models[eager_metadata.fqn], eager_metadata)
+                    final_metadata_batch.append(eager_metadata)
+                index.update_payload_references(final_metadata_batch)
 
         def hydrate_model(name: str) -> Model:
             metadata = index.metadata(name)

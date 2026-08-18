@@ -56,8 +56,8 @@ class StoredModelPayload:
     """Serialized model plus hashes that model pickling intentionally clears."""
 
     model: Model
-    data_hash: str
-    metadata_hash: str
+    data_hash: t.Optional[str]
+    metadata_hash: t.Optional[str]
 
 
 class ModelPayloadStore:
@@ -79,6 +79,14 @@ class ModelPayloadStore:
             ),
         )
 
+    def put_discovered(self, model: Model, metadata: ModelMetadata) -> None:
+        """Persists a pre-schema model without forcing hash calculation."""
+        self._cache.put(
+            metadata.payload_key or metadata.fqn,
+            metadata.payload_digest,
+            value=StoredModelPayload(model=model, data_hash=None, metadata_hash=None),
+        )
+
     def get(self, metadata: ModelMetadata) -> t.Optional[Model]:
         payload = self._cache.get(
             metadata.payload_key or metadata.fqn,
@@ -87,8 +95,10 @@ class ModelPayloadStore:
         if payload is None or isinstance(payload, Model):
             return payload
 
-        payload.model._data_hash = payload.data_hash
-        payload.model._metadata_hash = payload.metadata_hash
+        if payload.data_hash is not None:
+            payload.model._data_hash = payload.data_hash
+        if payload.metadata_hash is not None:
+            payload.model._metadata_hash = payload.metadata_hash
         return payload.model
 
 

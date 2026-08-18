@@ -2638,6 +2638,8 @@ def test_streaming_planner_releases_eager_models_after_load(tmp_path):
     assert isinstance(context._models, IndexedModelMapping)
     assert context.indexed_model_registry is not None
     assert context.model_graph_index is not None
+    assert context.model_discovery_max_batch_size == 1
+    assert context.model_schema_max_hydrated == 2
     assert context.indexed_model_registry.cache_size == 0
     assert sorted(context.models) == sorted(context.model_graph_index.iter_names())
 

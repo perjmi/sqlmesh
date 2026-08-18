@@ -12,6 +12,9 @@ from sqlmesh.core.model.cache import (
     optimized_query_cache_pool,
     OptimizedQueryCache,
 )
+from sqlmesh.core.model.graph import ProjectGraphIndex
+from sqlmesh.core.model.registry import ModelMetadata, ModelPayloadStore
+from sqlmesh.utils.errors import SQLMeshError
 
 if t.TYPE_CHECKING:
     from sqlmesh.core.model.definition import Model
@@ -28,6 +31,70 @@ def update_model_schemas(
     optimized_query_cache: OptimizedQueryCache = OptimizedQueryCache(cache_dir)
 
     _update_model_schemas(dag, models, schema, optimized_query_cache)
+
+
+def update_model_schemas_streaming(
+    index: ProjectGraphIndex,
+    payload_store: ModelPayloadStore,
+    cache_dir: Path,
+    batch_size: int,
+) -> int:
+    """Propagates schemas without retaining the complete set of model objects.
+
+    Each model is hydrated with at most one direct parent at a time. Parent column mappings, which
+    are the semantic input needed by query optimization, are copied into a compact mapping before
+    the parent payload is released. Returns the maximum simultaneously hydrated model count.
+    """
+    schema = MappingSchema(normalize=False)
+    optimized_query_cache = OptimizedQueryCache(cache_dir)
+    max_hydrated_models = 0
+
+    with optimized_query_cache_pool(optimized_query_cache) as executor:
+        for names in index.iter_topological_batches(batch_size):
+            for name in names:
+                metadata = index.metadata(name)
+                model = payload_store.get(metadata)
+                if model is None:
+                    raise SQLMeshError(f"Missing discovered model payload for '{name}'")
+
+                mapping = {}
+                for parent_name in metadata.dependencies:
+                    if not index.contains(parent_name):
+                        continue
+                    parent_metadata = index.metadata(parent_name)
+                    parent = payload_store.get(parent_metadata)
+                    if parent is None:
+                        raise SQLMeshError(f"Missing finalized parent payload for '{parent_name}'")
+                    mapping[parent_name] = parent.columns_to_types
+                    max_hydrated_models = max(max_hydrated_models, 2)
+                    del parent
+                max_hydrated_models = max(max_hydrated_models, 1)
+
+                try:
+                    future = executor.submit(
+                        load_optimized_query_and_mapping, model, mapping=mapping
+                    )
+                    fqn, entry_name, data_hash, metadata_hash, mapping_schema = future.result()
+                    if fqn != name:
+                        raise SQLMeshError(
+                            f"Schema worker returned '{fqn}' while processing '{name}'"
+                        )
+                    model._data_hash = data_hash
+                    model._metadata_hash = metadata_hash
+                    if model.mapping_schema != mapping_schema:
+                        model.set_mapping_schema(mapping_schema)
+                    optimized_query_cache.with_optimized_query(model, entry_name)
+                    _update_schema_with_model(schema, model)
+                    model.validate_definition()
+                except Exception as ex:
+                    raise SchemaError(f"Failed to update model schemas\n\n{ex}")
+
+                final_metadata = ModelMetadata.from_model(model)
+                payload_store.put(model, final_metadata)
+                index.update_payload_reference(final_metadata)
+                del model
+
+    return max_hydrated_models
 
 
 def _update_schema_with_model(schema: MappingSchema, model: Model) -> None:

@@ -7,6 +7,7 @@ from sqlglot import parse_one
 from sqlmesh.core.model import create_sql_model
 from sqlmesh.core.model.graph import ProjectGraphIndex
 from sqlmesh.core.model.registry import IndexedModelRegistry, ModelMetadata, ModelPayloadStore
+from sqlmesh.core.model.schema import update_model_schemas_streaming
 from sqlmesh.core.selector import MetadataSelector
 from sqlmesh.core.snapshot.definition import fingerprint_from_node
 from sqlmesh.core.snapshot.streaming import StreamingFingerprinter
@@ -139,6 +140,30 @@ def test_model_payload_store_round_trips_models_by_metadata_digest(tmp_path):
     assert hydrated.data_hash == "authoritative_data_hash"
     assert hydrated.metadata_hash == "authoritative_metadata_hash"
     assert store.get(_metadata("missing")) is None
+
+
+def test_streaming_schema_propagation_hydrates_only_child_and_one_parent(tmp_path):
+    model_a = create_sql_model("db.a", parse_one("SELECT 1 AS id"))
+    model_b = create_sql_model("db.b", parse_one("SELECT * FROM db.a"), depends_on={model_a.fqn})
+    index = ProjectGraphIndex(tmp_path / "graph.sqlite")
+    store = ModelPayloadStore(tmp_path / "payloads")
+    discovered = [
+        ModelMetadata.from_model(model, include_payload_digest=False)
+        for model in (model_a, model_b)
+    ]
+    index.replace(discovered)
+    for model, metadata in zip((model_a, model_b), discovered):
+        store.put_discovered(model, metadata)
+
+    max_hydrated = update_model_schemas_streaming(index, store, cache_dir=tmp_path, batch_size=1)
+
+    assert max_hydrated == 2
+    finalized_b_metadata = index.metadata(model_b.fqn)
+    assert finalized_b_metadata.payload_digest
+    finalized_b = store.get(finalized_b_metadata)
+    assert finalized_b is not None
+    assert finalized_b.mapping_schema
+    assert finalized_b.columns_to_types == model_a.columns_to_types
 
 
 def test_indexed_metadata_selection_does_not_enumerate_model_records(tmp_path, monkeypatch):

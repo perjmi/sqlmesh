@@ -18,19 +18,25 @@ The branch currently implements the shadow-safe foundation and keeps eager appli
   serialization.
 - An indexed compatibility mapping in `streaming` mode that releases the eager project dictionary
   after load and hydrates subsequent model access through the configured bounded LRU.
+- Native streaming schema propagation that retains one child and at most one hydrated parent while
+  copying direct-parent column mappings, then validates and persists each finalized model.
 - Topological, batch-bounded fingerprinting that persists results before model eviction.
 - A compact first-pass context diff based on snapshot headers.
 - Shadow checks for graph round-trips, selection, fingerprints, and context-diff change sets.
 - A two-Postgres random-graph oracle that runs eager reference plans against shadow candidates.
 
-The production streaming cutover is deliberately not claimed yet. Native SQL discovery now emits
-source-file batches into the graph transaction. `Loader.load` still constructs an eager dictionary for
-schema propagation and validation, but `streaming` mode releases it after final payload persistence and
-serves later model access from the indexed mapping. APIs that explicitly iterate model values can still
-hydrate the complete project, and `ContextDiff`, `Plan`, and plan stages still retain full snapshot
-payloads. Streaming application/checkpoints remain delivery milestones D and E below. This boundary
-prevents an opt-in mode from silently applying mixed semantics before the remaining accuracy and
-failure-injection gates pass.
+The production streaming cutover is deliberately not claimed yet. In `streaming` mode native SQL
+discovery emits and spills source-file batches without constructing a project-wide model dictionary.
+Schema propagation walks the indexed DAG and finalizes each model from its direct-parent column
+mappings. Later model access uses the indexed compatibility mapping. APIs that explicitly iterate model
+values can still hydrate the complete project, and `ContextDiff`, `Plan`, and plan stages still retain
+full snapshot payloads. Streaming application/checkpoints remain delivery milestones D and E below.
+This boundary prevents an opt-in mode from silently applying mixed semantics before the remaining
+accuracy and failure-injection gates pass.
+
+To preserve the bounded-memory contract, this cutover currently rejects Python and external-model
+projects in `streaming` mode before loading their model payloads; those projects must use `shadow` until
+their source formats have incremental readers. Eager and shadow behavior is unchanged.
 
 ## Goals
 
@@ -73,10 +79,10 @@ snapshot, state-sync, plan-builder, evaluator, dbt, and engine integration suite
 ### Local project
 
 `Loader.load` exposes native SQL results one source file at a time and the graph index consumes those
-batches transactionally. It still returns a `LoadedProject` containing the same fully hydrated `Model`
-instances. `Context.load` merges every project model into `_models`, builds the complete DAG, propagates
-mapping schemas, and validates every model before selection is applied. In `streaming` mode the eager
-mapping is then released and replaced by an indexed, bounded-hydration compatibility mapping.
+batches transactionally. Eager and shadow modes still return a `LoadedProject` containing the same fully
+hydrated `Model` instances. Native `streaming` mode instead spills each discovered payload and returns no
+local model dictionary. `Context.load` builds its DAG from metadata and propagates mapping schemas one
+model at a time before installing the indexed, bounded-hydration compatibility mapping.
 
 ### Remote state
 

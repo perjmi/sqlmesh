@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 from sqlmesh.cli.project_init import init_example_project
-from sqlmesh.core.config import Config, ModelDefaultsConfig
+from sqlmesh.core.config import Config, ModelDefaultsConfig, PlannerConfig, PlannerMode
 from sqlmesh.core.context import Context
 from sqlmesh.core.loader import SqlMeshLoader
 from sqlmesh.utils.errors import ConfigError
@@ -234,3 +234,21 @@ def test_sql_models_are_discovered_in_source_file_batches(
     assert len(discovered_batches) == 3
     assert all(len(batch) == 1 for batch in discovered_batches)
     assert {name for batch in discovered_batches for name in batch} == set(context.models)
+
+
+def test_streaming_mode_rejects_unbounded_python_model_loading(tmp_path: Path) -> None:
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "model.py").write_text(
+        'from sqlmesh import model\n@model("db.model")\ndef execute(context):\n    yield {"id": 1}'
+    )
+
+    with pytest.raises(ConfigError, match="native SQL models only"):
+        Context(
+            paths=tmp_path,
+            config=Config(
+                model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+                planner=PlannerConfig(mode=PlannerMode.STREAMING),
+            ),
+            load_state=False,
+        )
