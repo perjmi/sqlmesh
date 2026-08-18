@@ -34,7 +34,13 @@ class FileCache(t.Generic[T]):
             stored in the same cache folder.
     """
 
-    def __init__(self, path: Path, prefix: t.Optional[str] = None):
+    def __init__(
+        self,
+        path: Path,
+        prefix: t.Optional[str] = None,
+        *,
+        cleanup: bool = True,
+    ):
         self._path = path / prefix if prefix else path
 
         from sqlmesh.core.state_sync.base import SCHEMA_VERSION
@@ -55,6 +61,9 @@ class FileCache(t.Generic[T]):
                 str(SCHEMA_VERSION),
             ]
         )
+
+        if not cleanup:
+            return
 
         threshold = to_datetime("1 week ago").timestamp()
         # delete all old cache files

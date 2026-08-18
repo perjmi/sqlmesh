@@ -92,10 +92,10 @@ class OptimizedQueryCache:
         path: The path to the cache folder.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, cleanup: bool = True):
         self.path = path
         self._file_cache: FileCache[OptimizedQueryCacheEntry] = FileCache(
-            path, prefix="optimized_query"
+            path, prefix="optimized_query", cleanup=cleanup
         )
 
     def with_optimized_query(self, model: Model, name: t.Optional[str] = None) -> bool:

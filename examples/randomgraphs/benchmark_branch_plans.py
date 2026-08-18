@@ -34,6 +34,7 @@ RAW_FIELDS = (
     "branch",
     "commit",
     "planner_mode",
+    "workers",
     "width",
     "iteration",
     "seed",
@@ -183,7 +184,7 @@ def _reset_database() -> None:
     raise RuntimeError("Database reset failed after three attempts:\n" + "\n".join(failures))
 
 
-def _run_sample(image: str, planner_mode: str) -> dict[str, Any]:
+def _run_sample(image: str, planner_mode: str, workers: int) -> dict[str, Any]:
     _reset_database()
     command = [
         "docker",
@@ -204,12 +205,19 @@ def _run_sample(image: str, planner_mode: str) -> dict[str, Any]:
         "-e",
         "SQLMESH_CACHE_DIR=/tmp/sqlmesh-cache",
         "-e",
-        "MAX_FORK_WORKERS=1",
+        f"MAX_FORK_WORKERS={workers}",
         "-e",
         "PYTHONDONTWRITEBYTECODE=1",
     ]
     if planner_mode:
-        command.extend(("-e", f"SQLMESH__PLANNER__MODE={planner_mode}"))
+        command.extend(
+            (
+                "-e",
+                f"SQLMESH__PLANNER__MODE={planner_mode}",
+                "-e",
+                f"SQLMESH__PLANNER__STREAMING_WORKERS={workers}",
+            )
+        )
     command.extend(
         (
             "-v",
@@ -220,7 +228,13 @@ def _run_sample(image: str, planner_mode: str) -> dict[str, Any]:
             "--measure-plan",
         )
     )
-    result = _run(command)
+    try:
+        result = _run(command)
+    except subprocess.CalledProcessError as ex:
+        raise RuntimeError(
+            f"Benchmark container failed with exit code {ex.returncode}.\n"
+            f"stdout:\n{ex.stdout}\nstderr:\n{ex.stderr}"
+        ) from ex
     for line in reversed(result.stdout.splitlines()):
         if line.startswith(RESULT_MARKER):
             return json.loads(line.removeprefix(RESULT_MARKER))
@@ -274,6 +288,10 @@ def _write_summary(raw_path: Path, summary_path: Path) -> None:
         "rss_median_mib",
         "rss_stdev_mib",
         "rss_p95_mib",
+        "cgroup_peak_mean_mib",
+        "cgroup_peak_median_mib",
+        "cgroup_peak_stdev_mib",
+        "cgroup_peak_p95_mib",
     )
     output = []
     for (branch, width), group in sorted(
@@ -281,8 +299,10 @@ def _write_summary(raw_path: Path, summary_path: Path) -> None:
     ):
         times = [float(row["elapsed_seconds"]) for row in group]
         rss = [float(row["peak_rss_mib"]) for row in group]
+        cgroup_peak = [float(row["cgroup_peak_mib"]) for row in group]
         time_stdev = statistics.stdev(times) if len(times) > 1 else 0.0
         rss_stdev = statistics.stdev(rss) if len(rss) > 1 else 0.0
+        cgroup_peak_stdev = statistics.stdev(cgroup_peak) if len(cgroup_peak) > 1 else 0.0
         output.append(
             {
                 "branch": branch,
@@ -296,6 +316,10 @@ def _write_summary(raw_path: Path, summary_path: Path) -> None:
                 "rss_median_mib": f"{statistics.median(rss):.6f}",
                 "rss_stdev_mib": f"{rss_stdev:.6f}",
                 "rss_p95_mib": f"{_percentile(rss, 0.95):.6f}",
+                "cgroup_peak_mean_mib": f"{statistics.mean(cgroup_peak):.6f}",
+                "cgroup_peak_median_mib": f"{statistics.median(cgroup_peak):.6f}",
+                "cgroup_peak_stdev_mib": f"{cgroup_peak_stdev:.6f}",
+                "cgroup_peak_p95_mib": f"{_percentile(cgroup_peak, 0.95):.6f}",
             }
         )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -307,8 +331,14 @@ def _write_summary(raw_path: Path, summary_path: Path) -> None:
 
 def _benchmark(args: argparse.Namespace) -> int:
     revisions = (
-        ("main", args.main_image, args.main_commit, ""),
-        ("streaming", args.streaming_image, args.streaming_commit, "streaming"),
+        ("main", args.main_image, args.main_commit, "", 1),
+        (
+            "streaming",
+            args.streaming_image,
+            args.streaming_commit,
+            "streaming",
+            args.streaming_workers,
+        ),
     )
     rows, completed = _load_existing(args.output)
     _run((*COMPOSE, "up", "-d", "--wait", "postgres"), env=COMPOSE_ENV)
@@ -318,7 +348,7 @@ def _benchmark(args: argparse.Namespace) -> int:
                 seed = iteration - 1
                 generate_model_graph(width, seed=seed)
                 ordered_revisions = revisions if iteration % 2 else tuple(reversed(revisions))
-                for branch, image, commit, planner_mode in ordered_revisions:
+                for branch, image, commit, planner_mode, workers in ordered_revisions:
                     key = (branch, width, iteration)
                     if key in completed:
                         continue
@@ -326,13 +356,14 @@ def _benchmark(args: argparse.Namespace) -> int:
                         f"Running branch={branch} width={width} iteration={iteration} seed={seed}",
                         flush=True,
                     )
-                    measurement = _run_sample(image, planner_mode)
+                    measurement = _run_sample(image, planner_mode, workers)
                     peak_rss_bytes = int(measurement["peak_rss_bytes"])
                     cgroup_peak_bytes = int(measurement["cgroup_peak_bytes"])
                     row: dict[str, Any] = {
                         "branch": branch,
                         "commit": commit,
                         "planner_mode": planner_mode or "eager",
+                        "workers": workers,
                         "width": width,
                         "iteration": iteration,
                         "seed": seed,
@@ -372,6 +403,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--streaming-commit", default="")
     parser.add_argument("--widths", type=int, nargs="+", default=DEFAULT_WIDTHS)
     parser.add_argument("--samples", type=int, default=10)
+    parser.add_argument("--streaming-workers", type=int, default=2)
     parser.add_argument(
         "--output",
         type=Path,

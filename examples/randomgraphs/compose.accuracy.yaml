@@ -61,6 +61,9 @@ services:
       SQLMESH_CACHE_DIR: /tmp/sqlmesh-cache
       PYTHONDONTWRITEBYTECODE: 1
       SQLMESH__PLANNER__MODE: ${CANDIDATE_PLANNER_MODE:-shadow}
+      SQLMESH__PLANNER__STREAMING_WORKERS: ${STREAMING_WORKERS:-2}
+      SQLMESH__PLANNER__STREAMING_WORKER_MAX_TASKS: ${STREAMING_WORKER_MAX_TASKS:-25}
+      MAX_FORK_WORKERS: ${STREAMING_WORKERS:-2}
     depends_on:
       candidate_db:
         condition: service_healthy

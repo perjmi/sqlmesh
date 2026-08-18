@@ -5,11 +5,33 @@ import sqlite3
 import typing as t
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from sqlmesh.core.snapshot import Snapshot, SnapshotId
 from sqlmesh.utils.dag import DAG
 from sqlmesh.utils.errors import SQLMeshError
+
+
+@dataclass(frozen=True)
+class SerializedSnapshot:
+    """A worker-produced snapshot payload that can be inserted without coordinator hydration."""
+
+    snapshot_id: SnapshotId
+    parents: t.Tuple[SnapshotId, ...]
+    fingerprint: bytes
+    payload: bytes
+    is_new: bool
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Snapshot, *, is_new: bool) -> SerializedSnapshot:
+        return cls(
+            snapshot_id=snapshot.snapshot_id,
+            parents=snapshot.parents,
+            fingerprint=pickle.dumps(snapshot.fingerprint, protocol=pickle.HIGHEST_PROTOCOL),
+            payload=pickle.dumps(snapshot, protocol=pickle.HIGHEST_PROTOCOL),
+            is_new=is_new,
+        )
 
 
 class IndexedSnapshotMapping(Mapping[SnapshotId, Snapshot]):
@@ -138,7 +160,7 @@ class SnapshotPlanStore:
     :meth:`save_snapshot` and persisted in bounded transactions by :meth:`flush`.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -200,6 +222,7 @@ class SnapshotPlanStore:
                 CREATE TABLE IF NOT EXISTS snapshots (
                     name TEXT NOT NULL,
                     identifier TEXT NOT NULL,
+                    fingerprint BLOB NOT NULL,
                     payload BLOB NOT NULL,
                     is_new INTEGER NOT NULL,
                     PRIMARY KEY (name, identifier)
@@ -248,21 +271,41 @@ class SnapshotPlanStore:
             self._cache.pop(snapshot.snapshot_id, None)
             self._pending_payloads.pop(snapshot.snapshot_id, None)
 
+    def put_serialized_snapshots(self, snapshots: t.Iterable[SerializedSnapshot]) -> None:
+        """Writes worker-produced payloads without hydrating models in the coordinator."""
+        records = tuple(snapshots)
+        with self._connect() as connection:
+            for snapshot in records:
+                self._write_serialized_snapshot(connection, snapshot)
+        for snapshot in records:
+            self._cache.pop(snapshot.snapshot_id, None)
+            self._pending_payloads.pop(snapshot.snapshot_id, None)
+
     @staticmethod
     def _write_snapshot(
         connection: sqlite3.Connection, snapshot: Snapshot, *, is_new: bool
     ) -> None:
+        SnapshotPlanStore._write_serialized_snapshot(
+            connection,
+            SerializedSnapshot.from_snapshot(snapshot, is_new=is_new),
+        )
+
+    @staticmethod
+    def _write_serialized_snapshot(
+        connection: sqlite3.Connection, snapshot: SerializedSnapshot
+    ) -> None:
         snapshot_id = snapshot.snapshot_id
         connection.execute(
             """
-            INSERT OR REPLACE INTO snapshots(name, identifier, payload, is_new)
-            VALUES (?, ?, ?, ?)
+            INSERT OR REPLACE INTO snapshots(name, identifier, fingerprint, payload, is_new)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 snapshot_id.name,
                 snapshot_id.identifier,
-                sqlite3.Binary(pickle.dumps(snapshot, protocol=pickle.HIGHEST_PROTOCOL)),
-                is_new,
+                sqlite3.Binary(snapshot.fingerprint),
+                sqlite3.Binary(snapshot.payload),
+                snapshot.is_new,
             ),
         )
         connection.execute(
@@ -285,6 +328,24 @@ class SnapshotPlanStore:
                 for parent in snapshot.parents
             ),
         )
+
+    def get_fingerprint(self, snapshot_id: SnapshotId) -> t.Any:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT fingerprint FROM snapshots WHERE name = ? AND identifier = ?",
+                (snapshot_id.name, snapshot_id.identifier),
+            ).fetchone()
+        if row is None:
+            raise KeyError(snapshot_id)
+        return pickle.loads(row["fingerprint"])
+
+    def mark_new(self, snapshot_ids: t.Iterable[SnapshotId]) -> None:
+        records = tuple(snapshot_ids)
+        with self._connect() as connection:
+            connection.executemany(
+                "UPDATE snapshots SET is_new = 1 WHERE name = ? AND identifier = ?",
+                ((snapshot_id.name, snapshot_id.identifier) for snapshot_id in records),
+            )
 
     def get_snapshot(self, snapshot_id: SnapshotId, *, new_only: bool = False) -> Snapshot:
         cached = self._cache.get(snapshot_id)

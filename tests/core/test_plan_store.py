@@ -3,7 +3,7 @@ from sqlglot import parse_one
 from sqlmesh.core.context_diff import ContextDiff
 from sqlmesh.core.model import SqlModel
 from sqlmesh.core.plan import PlanBuilder
-from sqlmesh.core.plan.store import SnapshotPlanStore
+from sqlmesh.core.plan.store import SerializedSnapshot, SnapshotPlanStore
 from sqlmesh.core.snapshot import SnapshotChangeCategory
 
 
@@ -38,6 +38,19 @@ def test_snapshot_plan_store_is_persistent_and_bounded(tmp_path, make_snapshot):
     reopened = SnapshotPlanStore(path, max_cached_snapshots=1)
     assert reopened.snapshots[snapshots[3].snapshot_id].name == snapshots[3].name
     assert snapshots[0].snapshot_id not in reopened.new_snapshots
+
+
+def test_snapshot_plan_store_accepts_worker_serialized_snapshots(tmp_path, make_snapshot):
+    snapshot = make_snapshot(SqlModel(name="model", query=parse_one("SELECT 1 AS value")))
+    serialized = SerializedSnapshot.from_snapshot(snapshot, is_new=True)
+    store = SnapshotPlanStore(tmp_path / "plan.sqlite", max_cached_snapshots=0)
+
+    store.put_serialized_snapshots((serialized,))
+
+    restored = store.snapshots[snapshot.snapshot_id]
+    assert restored.dict() == snapshot.dict()
+    assert restored.snapshot_id in store.new_snapshots
+    assert set(store.parents(snapshot.snapshot_id)) == set(snapshot.parents)
 
 
 def test_snapshot_plan_store_persists_mutations_when_a_snapshot_is_evicted(tmp_path, make_snapshot):

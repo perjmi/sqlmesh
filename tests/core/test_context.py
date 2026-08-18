@@ -2674,6 +2674,67 @@ def test_streaming_planner_releases_eager_models_after_load(tmp_path):
     assert context.indexed_model_registry.cache_size == 0
 
 
+def test_streaming_plan_builds_snapshots_without_coordinator_model_hydration(
+    tmp_path, monkeypatch
+):
+    models_path = tmp_path / "models"
+    models_path.mkdir()
+    (models_path / "a.sql").write_text("MODEL (name db.a); SELECT 1 AS id")
+    (models_path / "b.sql").write_text("MODEL (name db.b); SELECT * FROM db.a")
+    context = Context(
+        paths=[tmp_path],
+        config=Config(
+            model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+            planner=PlannerConfig(
+                mode=PlannerMode.STREAMING,
+                streaming_workers=2,
+                streaming_worker_max_tasks=1,
+            ),
+        ),
+    )
+    assert context.indexed_model_registry is not None
+
+    def fail_if_hydrated(name):
+        raise AssertionError(f"coordinator hydrated model '{name}'")
+
+    monkeypatch.setattr(context.indexed_model_registry, "hydrate", fail_if_hydrated)
+
+    plan = context.plan_builder("dev", skip_tests=True, skip_backfill=True).build()
+
+    assert len(plan.new_snapshots) == 2
+    assert context.indexed_model_registry.max_cache_size_seen == 0
+
+
+def test_streaming_full_load_diff_marks_new_snapshots_without_hydrating_payloads(
+    tmp_path, monkeypatch
+):
+    from sqlmesh.core.plan.store import IndexedSnapshotNameMapping
+
+    models_path = tmp_path / "models"
+    models_path.mkdir()
+    (models_path / "a.sql").write_text("MODEL (name db.a); SELECT 1 AS id")
+    (models_path / "b.sql").write_text("MODEL (name db.b); SELECT * FROM db.a")
+    context = Context(
+        paths=[tmp_path],
+        config=Config(
+            model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+            planner=PlannerConfig(mode=PlannerMode.STREAMING),
+        ),
+    )
+    snapshots = context._snapshots()
+    assert isinstance(snapshots, IndexedSnapshotNameMapping)
+
+    def fail_if_hydrated(snapshot_id, *, new_only=False):
+        raise AssertionError(f"coordinator hydrated snapshot '{snapshot_id}'")
+
+    monkeypatch.setattr(snapshots.store, "get_snapshot", fail_if_hydrated)
+
+    context_diff = context._context_diff("dev", snapshots=snapshots)
+
+    assert len(context_diff.added) == 2
+    assert len(context_diff.new_snapshots) == 2
+
+
 def test_requirements(copy_to_temp_path: t.Callable):
     from sqlmesh.utils.metaprogramming import Executable
 

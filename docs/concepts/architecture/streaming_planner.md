@@ -12,22 +12,23 @@ The branch currently implements the shadow-safe foundation and keeps eager appli
 - An entry-bounded snapshot LRU and deterministic batched state hydration APIs.
 - A dict-compatible eager registry plus a bounded indexed registry backed by per-model payload files.
 - A transactional, versioned SQLite graph index with indexed selection and dependency queries.
-- Source-file-bounded native SQL discovery that writes graph metadata through one atomic replacement;
-  the largest observed discovery batch is exposed for tests and diagnostics.
+- Source-file-bounded native SQL discovery in a bounded, recyclable worker pool. Workers persist model
+  payloads directly and return only compact metadata to the single SQLite writer in the coordinator.
 - Versioned model payloads that preserve authoritative post-schema data and metadata hashes across
   serialization.
 - An indexed compatibility mapping in `streaming` mode that releases the eager project dictionary
   after load and hydrates subsequent model access through the configured bounded LRU.
-- Native streaming schema propagation that retains one child and at most one hydrated parent while
-  copying direct-parent column mappings, then validates and persists each finalized model.
+- Parallel streaming schema propagation with topological barriers. Each worker hydrates one child and
+  at most one parent at a time, then validates and persists the finalized model before returning compact
+  metadata to the coordinator.
 - SQLite-spilled topological traversal and an indexed `Context.dag` view, so Python never reconstructs
   the complete edge map during native streaming load, schema propagation, or fingerprinting.
-- Topological, batch-bounded fingerprinting that persists results before model eviction.
+- Topological, batch-bounded fingerprinting over metadata hashes without hydrating model payloads.
 - A compact first-pass context diff based on snapshot headers.
 - A per-plan SQLite snapshot catalog with bounded, write-back hydration, lazy ID/name/sequence views,
   persisted snapshot edges, and disk-backed topological traversal.
-- Streaming context-diff merging and selected-plan snapshot generation that write complete snapshot
-  payloads directly to the plan catalog instead of constructing all-snapshot dictionaries.
+- Worker-built snapshot payloads and streaming context-diff merging that write serialized snapshots
+  directly to the plan catalog instead of constructing all-snapshot dictionaries in the coordinator.
 - SQLite-backed snapshot DAG traversal, deployability propagation, and earliest-start inference.
 - Shadow checks for graph round-trips, selection, fingerprints, and context-diff change sets.
 - A two-Postgres random-graph oracle that runs eager reference plans against shadow candidates.
@@ -48,11 +49,12 @@ projects in `streaming` mode before loading their model payloads; those projects
 their source formats have incremental readers. Eager and shadow behavior is unchanged.
 
 The native local-project memory guarantee is independent of total DAG width and depth. Its working set is
-bounded by the largest source-file batch, active loader workers, configured traversal batch, current
-model, and that model's direct-parent column schemas. A single model with unusually many parents or
-columns can therefore increase the boundary, but unrelated models and edges remain on disk. Commands
-that explicitly request the complete graph or complete model mapping are materializing compatibility
-APIs and are outside this bound.
+bounded by the configured number of active workers, each worker's current model and direct-parent column
+schemas, bounded coordinator result batches, and configured hydration caches. Worker pools are recycled
+after a configured task count so allocator high-water marks are released. A single model with unusually
+many parents or columns can therefore increase the boundary, but unrelated models, columns, edges, and
+completed snapshots remain on disk. Commands that explicitly request the complete graph or complete
+model mapping are materializing compatibility APIs and are outside this bound.
 
 ## Goals
 
@@ -240,7 +242,16 @@ planner:
   snapshot_batch_size: 10
   hydrated_model_cache_size: 250
   hydrated_snapshot_cache_size: 250
+  streaming_workers: 2
+  streaming_worker_max_tasks: 25
 ```
+
+`streaming_workers` is also capped by `MAX_FORK_WORKERS`. The coordinator is the only SQLite writer;
+workers read indexed dependencies, persist immutable payload files, and return compact metadata or
+serialized snapshots. Set `streaming_workers: 1` for the smallest process footprint, or increase it for
+parallel discovery, schema propagation, and snapshot construction. Lowering
+`streaming_worker_max_tasks` recycles processes more often and can reduce allocator retention at the cost
+of additional process startup time.
 
 Rollout stages:
 

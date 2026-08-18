@@ -24,8 +24,9 @@ class ProjectGraphWriter:
             """
             INSERT INTO models(
                 fqn, name, source_path, project, dialect, gateway, enabled,
-                kind_name, tags, dbt_fqn, payload_key, payload_digest
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                kind_name, tags, dbt_fqn, payload_key, payload_digest, data_hash, metadata_hash,
+                python_env_imports
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.fqn,
@@ -40,6 +41,9 @@ class ProjectGraphWriter:
                 record.dbt_fqn,
                 record.payload_key,
                 record.payload_digest,
+                record.data_hash,
+                record.metadata_hash,
+                json.dumps(record.python_env_imports),
             ),
         )
         self._connection.executemany(
@@ -57,7 +61,7 @@ class ProjectGraphWriter:
 class ProjectGraphIndex:
     """A disposable, transactional SQLite index of lightweight model metadata."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -98,7 +102,10 @@ class ProjectGraphIndex:
                     tags TEXT NOT NULL,
                     dbt_fqn TEXT,
                     payload_key TEXT NOT NULL,
-                    payload_digest TEXT NOT NULL
+                    payload_digest TEXT NOT NULL,
+                    data_hash TEXT,
+                    metadata_hash TEXT,
+                    python_env_imports TEXT NOT NULL
                 )
                 """
             )
@@ -196,6 +203,15 @@ class ProjectGraphIndex:
             row = connection.execute("SELECT COUNT(*) AS count FROM models").fetchone()
         return int(row["count"])
 
+    def has_python_env_imports(self) -> bool:
+        with self._connect() as connection:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM models WHERE python_env_imports != '[]' LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+
     def update_payload_reference(self, record: ModelMetadata) -> None:
         """Updates a payload after schema propagation without rebuilding graph metadata."""
         self.update_payload_references((record,))
@@ -204,10 +220,19 @@ class ProjectGraphIndex:
         """Updates a bounded batch of post-schema payload references."""
         with self._connect() as connection:
             updates = tuple(
-                (record.payload_key, record.payload_digest, record.fqn) for record in records
+                (
+                    record.payload_key,
+                    record.payload_digest,
+                    record.data_hash,
+                    record.metadata_hash,
+                    record.fqn,
+                )
+                for record in records
             )
             connection.executemany(
-                "UPDATE models SET payload_key = ?, payload_digest = ? WHERE fqn = ?", updates
+                "UPDATE models SET payload_key = ?, payload_digest = ?, data_hash = ?, "
+                "metadata_hash = ? WHERE fqn = ?",
+                updates,
             )
             if connection.total_changes != len(updates):
                 raise KeyError("One or more model payload references do not exist")
@@ -520,6 +545,9 @@ class ProjectGraphIndex:
             dbt_fqn=row["dbt_fqn"],
             payload_key=row["payload_key"],
             payload_digest=row["payload_digest"],
+            data_hash=row["data_hash"],
+            metadata_hash=row["metadata_hash"],
+            python_env_imports=tuple(json.loads(row["python_env_imports"])),
         )
 
 

@@ -34,6 +34,7 @@ from sqlmesh.core.model import (
 )
 from sqlmesh.core.model import model as model_registry
 from sqlmesh.core.model.common import make_python_env
+from sqlmesh.core.model.registry import ModelMetadata, ModelPayloadStore
 from sqlmesh.core.signal import signal
 from sqlmesh.core.test import ModelTestMetadata
 from sqlmesh.utils import UniqueKeyDict, sys_path
@@ -106,6 +107,7 @@ _defaults: t.Optional[t.Dict[str, t.Any]] = None
 _cache: t.Optional[CacheBase] = None
 _config_essentials: t.Optional[t.Dict[str, t.Any]] = None
 _selected_gateway: t.Optional[str] = None
+_streaming_payload_store: t.Optional[ModelPayloadStore] = None
 
 
 def _init_model_defaults(
@@ -114,12 +116,18 @@ def _init_model_defaults(
     model_loading_defaults: t.Optional[t.Dict[str, t.Any]] = None,
     cache: t.Optional[CacheBase] = None,
     console: t.Optional[Console] = None,
+    streaming_payload_store_path: t.Optional[str] = None,
 ) -> None:
-    global _defaults, _cache, _config_essentials, _selected_gateway
+    global _defaults, _cache, _config_essentials, _selected_gateway, _streaming_payload_store
     _defaults = model_loading_defaults
     _cache = cache
     _config_essentials = config_essentials
     _selected_gateway = selected_gateway
+    _streaming_payload_store = (
+        ModelPayloadStore(Path(streaming_payload_store_path), cleanup=False)
+        if streaming_payload_store_path is not None
+        else None
+    )
 
     # Set the console passed from the parent process
     if console is not None:
@@ -137,6 +145,28 @@ def load_sql_models(path: Path) -> t.List[Model]:
     models = load_sql_based_models(expressions, path=Path(path).absolute(), **_defaults)
 
     return [] if _cache.put(models, path) else models
+
+
+def load_sql_model_metadata(path: Path) -> t.Tuple[ModelMetadata, ...]:
+    """Loads and persists SQL models in a worker without returning their ASTs to the coordinator."""
+    assert _defaults
+    assert _cache
+    assert _streaming_payload_store
+
+    models = _cache.get(path)
+    if not models:
+        with open(path, "r", encoding="utf-8") as file:
+            expressions = parse(file.read(), default_dialect=_defaults["dialect"])
+        models = load_sql_based_models(expressions, path=Path(path).absolute(), **_defaults)
+        _cache.put(models, path)
+
+    metadata = []
+    for model in models:
+        model._path = path
+        record = ModelMetadata.from_model(model, include_payload_digest=False)
+        _streaming_payload_store.put_discovered(model, record)
+        metadata.append(record)
+    return tuple(metadata)
 
 
 def get_variables(gateway_name: t.Optional[str] = None) -> t.Dict[str, t.Any]:
@@ -179,7 +209,9 @@ class Loader(abc.ABC):
         self.config_path = path
         self.config = self.context.configs[self.config_path]
         self._variables_by_gateway: t.Dict[str, t.Dict[str, t.Any]] = {}
-        self._model_batch_consumer: t.Optional[t.Callable[[t.Tuple[Model, ...]], None]] = None
+        self._model_batch_consumer: t.Optional[
+            t.Callable[[t.Tuple[t.Union[Model, ModelMetadata], ...]], None]
+        ] = None
         self._retain_model_batches = True
         self._discovered_model_names: t.Set[str] = set()
         self._console = get_console()
@@ -193,7 +225,9 @@ class Loader(abc.ABC):
 
     def set_model_batch_consumer(
         self,
-        consumer: t.Optional[t.Callable[[t.Tuple[Model, ...]], None]],
+        consumer: t.Optional[
+            t.Callable[[t.Tuple[t.Union[Model, ModelMetadata], ...]], None]
+        ],
         *,
         retain_models: bool = True,
     ) -> None:
@@ -201,7 +235,7 @@ class Loader(abc.ABC):
         self._model_batch_consumer = consumer
         self._retain_model_batches = retain_models
 
-    def _emit_model_batch(self, models: t.Iterable[Model]) -> None:
+    def _emit_model_batch(self, models: t.Iterable[t.Union[Model, ModelMetadata]]) -> None:
         if self._model_batch_consumer is not None:
             batch = tuple(models)
             if batch:
@@ -624,10 +658,14 @@ class SqlMeshLoader(Loader):
         for loaded_models in self._iter_sql_model_batches(
             macros, jinja_macros, audits, signals, cache, gateway
         ):
-            enabled_models = []
+            enabled_models: t.List[t.Union[Model, ModelMetadata]] = []
             for model in loaded_models:
                 if model.fqn in discovered_names:
-                    path = model._path or self.config_path
+                    path = (
+                        model.source_path
+                        if isinstance(model, ModelMetadata)
+                        else model._path
+                    ) or self.config_path
                     raise ConfigError(
                         self._failed_to_load_model_error(
                             path, f"Duplicate SQL model name: '{model.name}'."
@@ -637,6 +675,7 @@ class SqlMeshLoader(Loader):
                 if model.enabled:
                     discovered_names.add(model.fqn)
                     if self._retain_model_batches:
+                        assert isinstance(model, Model)
                         models[model.fqn] = model
                     enabled_models.append(model)
             self._emit_model_batch(enabled_models)
@@ -651,7 +690,7 @@ class SqlMeshLoader(Loader):
         signals: UniqueKeyDict[str, signal],
         cache: CacheBase,
         gateway: t.Optional[str],
-    ) -> t.Iterator[t.Tuple[Model, ...]]:
+    ) -> t.Iterator[t.Tuple[t.Union[Model, ModelMetadata], ...]]:
         """Yields SQL models one source file at a time.
 
         Keeping source-file results as the ownership boundary lets indexed loaders persist a
@@ -669,7 +708,7 @@ class SqlMeshLoader(Loader):
                 continue
 
             self._track_file(path)
-            if cached_models := cache.get(path):
+            if self._retain_model_batches and (cached_models := cache.get(path)):
                 yield tuple(cached_models)
             else:
                 paths.add(path)
@@ -693,28 +732,53 @@ class SqlMeshLoader(Loader):
                 virtual_environment_mode=self.config.virtual_environment_mode,
             )
 
-            with create_process_pool_executor(
-                initializer=_init_model_defaults,
-                initargs=(
-                    self.config_essentials,
-                    gateway,
-                    model_loading_defaults,
-                    cache,
-                    self._console,
-                ),
-                max_workers=c.MAX_FORK_WORKERS,
-            ) as pool:
-                futures_to_paths = {pool.submit(load_sql_models, path): path for path in paths}
-                for future in concurrent.futures.as_completed(futures_to_paths):
-                    path = futures_to_paths.pop(future)
-                    try:
-                        loaded = future.result()
-                        models = loaded or cache.get(path)
-                        for model in models:
-                            model._path = path
-                        yield tuple(models)
-                    except Exception as ex:
-                        raise ConfigError(self._failed_to_load_model_error(path, ex), path)
+            worker_count = c.MAX_FORK_WORKERS
+            worker_max_tasks = len(paths)
+            load_function: t.Callable[
+                [Path], t.Union[t.List[Model], t.Tuple[ModelMetadata, ...]]
+            ] = load_sql_models
+            streaming_payload_store_path: t.Optional[str] = None
+            if not self._retain_model_batches:
+                worker_count = min(
+                    self.config.planner.streaming_workers,
+                    c.MAX_FORK_WORKERS or self.config.planner.streaming_workers,
+                )
+                worker_max_tasks = self.config.planner.streaming_worker_max_tasks
+                load_function = load_sql_model_metadata
+                streaming_payload_store_path = str(self.context.cache_dir)
+
+            resolved_workers = max(1, worker_count or 1)
+            pool_capacity = resolved_workers * worker_max_tasks
+            ordered_paths = sorted(paths)
+            for offset in range(0, len(ordered_paths), pool_capacity):
+                path_batch = ordered_paths[offset : offset + pool_capacity]
+                with create_process_pool_executor(
+                    initializer=_init_model_defaults,
+                    initargs=(
+                        self.config_essentials,
+                        gateway,
+                        model_loading_defaults,
+                        cache,
+                        self._console,
+                        streaming_payload_store_path,
+                    ),
+                    max_workers=worker_count,
+                ) as pool:
+                    futures_to_paths = {
+                        pool.submit(load_function, path): path for path in path_batch
+                    }
+                    for future in concurrent.futures.as_completed(futures_to_paths):
+                        path = futures_to_paths.pop(future)
+                        try:
+                            loaded = future.result()
+                            if self._retain_model_batches:
+                                loaded = loaded or cache.get(path)
+                                for model in loaded:
+                                    assert isinstance(model, Model)
+                                    model._path = path
+                            yield tuple(loaded)
+                        except Exception as ex:
+                            raise ConfigError(self._failed_to_load_model_error(path, ex), path)
 
     def _load_python_models(
         self,

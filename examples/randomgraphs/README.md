@@ -86,6 +86,15 @@ CANDIDATE_PLANNER_MODE=streaming pytest -q -o addopts='' -p no:cacheprovider \
   tests/test_dual_planner_accuracy.py
 ```
 
+Native streaming plans use two bounded workers by default in this suite. Override
+`STREAMING_WORKERS` to control parallelism and `STREAMING_WORKER_MAX_TASKS` to control how often
+worker processes are recycled. The coordinator remains the sole SQLite writer; workers persist
+model payloads independently and return compact metadata or serialized snapshots.
+
+For multi-process memory comparisons, use `cgroup_peak_mib` from `benchmark_branch_plans.py` as the
+primary whole-container measurement. Aggregate RSS remains in the output for continuity but counts
+fork-shared pages once per process.
+
 By default, each input table receives a deterministic random count of 10 to 1,000 rows. All
 tables use the same key sequence starting at `1`, so every join has matching records and every
 leaf model contains data. Override the bounds with `--min-rows-per-input` and

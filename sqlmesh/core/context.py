@@ -40,6 +40,7 @@ import sys
 import time
 import traceback
 import typing as t
+from concurrent.futures import Future, as_completed
 from functools import cached_property
 from io import StringIO
 from itertools import chain
@@ -105,6 +106,7 @@ from sqlmesh.core.plan.definition import UserProvidedFlags
 from sqlmesh.core.plan.store import (
     IndexedSnapshotMapping,
     IndexedSnapshotNameMapping,
+    SerializedSnapshot,
     SnapshotPlanStore,
 )
 from sqlmesh.core.reference import ReferenceGraph
@@ -116,13 +118,17 @@ from sqlmesh.core.snapshot import (
     Snapshot,
     SnapshotEvaluator,
     SnapshotFingerprint,
-    SnapshotId,
     SnapshotTableInfo,
     missing_intervals,
     to_table_mapping,
 )
 from sqlmesh.core.snapshot.definition import fingerprint_from_node, get_next_model_interval_start
-from sqlmesh.core.snapshot.streaming import StreamingFingerprinter
+from sqlmesh.core.snapshot.streaming import (
+    StreamingFingerprinter,
+    StreamingSnapshotTask,
+    build_serialized_streaming_snapshot,
+    init_streaming_snapshot_worker,
+)
 from sqlmesh.core.state_sync import (
     CachingStateSync,
     StateReader,
@@ -160,6 +166,7 @@ from sqlmesh.utils.errors import (
 )
 from sqlmesh.utils.config import print_config
 from sqlmesh.utils.jinja import JinjaMacroRegistry
+from sqlmesh.utils.process import PoolExecutor, create_process_pool_executor
 from sqlmesh.utils.windows import IS_WINDOWS, fix_windows_path
 
 if t.TYPE_CHECKING:
@@ -686,13 +693,22 @@ class GenericContext(BaseContext, t.Generic[C]):
             discovery_payload_store = ModelPayloadStore(self.cache_dir)
             with discovery_index.replacing() as writer:
 
-                def persist_model_batch(models: t.Tuple[Model, ...]) -> None:
+                def persist_model_batch(
+                    models: t.Tuple[t.Union[Model, ModelMetadata], ...]
+                ) -> None:
                     self._model_discovery_max_batch_size = max(
                         self._model_discovery_max_batch_size, len(models)
                     )
                     for model in models:
-                        metadata = ModelMetadata.from_model(model, include_payload_digest=False)
-                        if self.config.planner.mode == PlannerMode.STREAMING:
+                        metadata = (
+                            model
+                            if isinstance(model, ModelMetadata)
+                            else ModelMetadata.from_model(model, include_payload_digest=False)
+                        )
+                        if (
+                            self.config.planner.mode == PlannerMode.STREAMING
+                            and not isinstance(model, ModelMetadata)
+                        ):
                             discovery_payload_store.put_discovered(model, metadata)
                         writer.add(metadata)
 
@@ -799,6 +815,11 @@ class GenericContext(BaseContext, t.Generic[C]):
                     ModelPayloadStore(self.cache_dir),
                     cache_dir=self.cache_dir,
                     batch_size=self.config.planner.model_batch_size,
+                    max_workers=min(
+                        self.config.planner.streaming_workers,
+                        c.MAX_FORK_WORKERS or self.config.planner.streaming_workers,
+                    ),
+                    worker_max_tasks=self.config.planner.streaming_worker_max_tasks,
                 )
             else:
                 for fqn in self.dag:
@@ -1844,9 +1865,24 @@ class GenericContext(BaseContext, t.Generic[C]):
             self.environment_ttl if environment not in self.pinned_environments else None
         )
 
-        model_selector = self._new_selector()
+        model_selector = (
+            self._new_selector()
+            if self.config.planner.mode != PlannerMode.STREAMING
+            or any(
+                selection is not None
+                for selection in (
+                    allow_destructive_models,
+                    allow_additive_models,
+                    backfill_models,
+                    select_models,
+                    restate_models,
+                )
+            )
+            else None
+        )
 
         if allow_destructive_models:
+            assert model_selector is not None
             expanded_destructive_models = model_selector.expand_model_selections(
                 allow_destructive_models
             )
@@ -1854,11 +1890,13 @@ class GenericContext(BaseContext, t.Generic[C]):
             expanded_destructive_models = None
 
         if allow_additive_models:
+            assert model_selector is not None
             expanded_additive_models = model_selector.expand_model_selections(allow_additive_models)
         else:
             expanded_additive_models = None
 
         if backfill_models:
+            assert model_selector is not None
             backfill_models = model_selector.expand_model_selections(backfill_models)
         else:
             backfill_models = None
@@ -1867,6 +1905,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         selected_fqns: t.Set[str] = set()
         selected_deletion_fqns: t.Set[str] = set()
         if select_models:
+            assert model_selector is not None
             try:
                 models_override, selected_fqns = model_selector.select_models(
                     select_models,
@@ -1890,6 +1929,7 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         expanded_restate_models = None
         if restate_models is not None:
+            assert model_selector is not None
             expanded_restate_models = model_selector.expand_model_selections(restate_models)
 
         if (restate_models is not None and not expanded_restate_models) or (
@@ -2043,11 +2083,15 @@ class GenericContext(BaseContext, t.Generic[C]):
             end_override_per_model=max_interval_end_per_model,
             console=self.console,
             user_provided_flags=user_provided_flags,
-            selected_models={
-                dbt_unique_id
-                for model in model_selector.expand_model_selections(select_models or "*")
-                if (dbt_unique_id := snapshots[model].node.dbt_unique_id)
-            },
+            selected_models=(
+                {
+                    dbt_unique_id
+                    for model in model_selector.expand_model_selections(select_models or "*")
+                    if (dbt_unique_id := snapshots[model].node.dbt_unique_id)
+                }
+                if model_selector is not None
+                else set()
+            ),
             explain=explain or False,
             ignore_cron=ignore_cron or False,
         )
@@ -3190,7 +3234,6 @@ class GenericContext(BaseContext, t.Generic[C]):
             self._active_plan_store = store
             created_ts = now_timestamp()
             index = self._model_graph_index
-            registry = self._indexed_model_registry
             if models_override is not None:
                 fingerprint_cache: t.Dict[str, SnapshotFingerprint] = {}
                 selected_snapshot_batch: t.List[t.Tuple[Snapshot, bool]] = []
@@ -3220,45 +3263,77 @@ class GenericContext(BaseContext, t.Generic[C]):
                     store.put_snapshots(selected_snapshot_batch)
                 return store.snapshots_by_name
 
-            for names in index.iter_topological_batches(self.config.planner.snapshot_batch_size):
-                indexed_snapshot_batch: t.List[t.Tuple[Snapshot, bool]] = []
-                try:
-                    for name in names:
-                        node = registry.hydrate(name)
-                        indexed_snapshot_kwargs: t.Dict[str, t.Any] = {}
-                        if node.project in self._projects:
-                            config = self.config_for_node(node)
-                            indexed_snapshot_kwargs["ttl"] = config.snapshot_ttl
-                            indexed_snapshot_kwargs["table_naming_convention"] = (
-                                config.physical_table_naming_convention
+            worker_count = min(
+                self.config.planner.streaming_workers,
+                c.MAX_FORK_WORKERS or self.config.planner.streaming_workers,
+            )
+            resolved_workers = max(1, worker_count)
+            task_capacity = (
+                resolved_workers * self.config.planner.streaming_worker_max_tasks
+            )
+            executor: t.Optional[PoolExecutor] = None
+            tasks_in_executor = 0
+            try:
+                for names in index.iter_topological_batches(
+                    self.config.planner.snapshot_batch_size
+                ):
+                    offset = 0
+                    while offset < len(names):
+                        if executor is None:
+                            executor = create_process_pool_executor(
+                                initializer=init_streaming_snapshot_worker,
+                                initargs=(str(index.path), str(self.cache_dir)),
+                                max_workers=worker_count,
                             )
+                            tasks_in_executor = 0
 
-                        metadata = index.metadata(name)
-                        snapshot = Snapshot(
-                            name=node.fqn,
-                            fingerprint=index.fingerprint(name),
-                            node=node,
-                            parents=tuple(
-                                SnapshotId(
-                                    name=parent,
-                                    identifier=index.fingerprint(parent).to_identifier(),
+                        available_capacity = task_capacity - tasks_in_executor
+                        selected_names = names[offset : offset + available_capacity]
+                        tasks = []
+                        for name in selected_names:
+                            metadata = index.metadata(name)
+                            config = (
+                                self.config_for_path(metadata.source_path)[0]
+                                if metadata.source_path is not None
+                                else self.config
+                            )
+                            tasks.append(
+                                StreamingSnapshotTask(
+                                    name=name,
+                                    created_ts=created_ts,
+                                    ttl=(
+                                        config.snapshot_ttl
+                                        if metadata.project in self._projects
+                                        else c.DEFAULT_SNAPSHOT_TTL
+                                    ),
+                                    table_naming_convention=(
+                                        config.physical_table_naming_convention
+                                        if metadata.project in self._projects
+                                        else TableNamingConvention.default
+                                    ),
                                 )
-                                for parent in metadata.dependencies
-                                if index.contains(parent)
-                            ),
-                            intervals=[],
-                            dev_intervals=[],
-                            created_ts=created_ts,
-                            updated_ts=created_ts,
-                            ttl=indexed_snapshot_kwargs.get("ttl", c.DEFAULT_SNAPSHOT_TTL),
-                            table_naming_convention=indexed_snapshot_kwargs.get(
-                                "table_naming_convention", TableNamingConvention.default
-                            ),
+                            )
+                        futures: t.List[Future[SerializedSnapshot]] = [
+                            executor.submit(build_serialized_streaming_snapshot, task)
+                            for task in tasks
+                        ]
+                        serialized = [future.result() for future in as_completed(futures)]
+                        serialized.sort(
+                            key=lambda snapshot: (
+                                snapshot.snapshot_id.name,
+                                snapshot.snapshot_id.identifier,
+                            )
                         )
-                        indexed_snapshot_batch.append((snapshot, False))
-                    store.put_snapshots(indexed_snapshot_batch)
-                finally:
-                    registry.evict(names)
+                        store.put_serialized_snapshots(serialized)
+
+                        tasks_in_executor += len(selected_names)
+                        offset += len(selected_names)
+                        if tasks_in_executor == task_capacity:
+                            executor.shutdown(wait=True)
+                            executor = None
+            finally:
+                if executor is not None:
+                    executor.shutdown(wait=True)
             return store.snapshots_by_name
 
         nodes = {**(models_override or self._models), **self._standalone_audits}
@@ -3314,7 +3389,14 @@ class GenericContext(BaseContext, t.Generic[C]):
             diff_rendered=diff_rendered,
             environment_statements=self._environment_statements,
             gateway_managed_virtual_layer=self.config.gateway_managed_virtual_layer,
-            infer_python_dependencies=self.config.infer_python_dependencies,
+            infer_python_dependencies=(
+                self.config.infer_python_dependencies
+                and (
+                    not isinstance(local_snapshots, IndexedSnapshotNameMapping)
+                    or self._model_graph_index is None
+                    or self._model_graph_index.has_python_env_imports()
+                )
+            ),
             always_recreate_environment=always_recreate_environment,
         )
         if self.config.planner.mode == PlannerMode.SHADOW and self._model_graph_index is not None:
@@ -3819,6 +3901,9 @@ class GenericContext(BaseContext, t.Generic[C]):
         models: t.Optional[t.Iterable[t.Union[str, Model]]] = None,
         raise_on_error: bool = True,
     ) -> t.List[AnnotatedRuleViolation]:
+        if not any(linter.enabled for linter in self._linters.values()):
+            return []
+
         found_error = False
 
         model_list = (

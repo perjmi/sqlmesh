@@ -4,6 +4,7 @@ from sqlmesh.cli.project_init import init_example_project
 from sqlmesh.core.config import Config, ModelDefaultsConfig, PlannerConfig, PlannerMode
 from sqlmesh.core.context import Context
 from sqlmesh.core.loader import SqlMeshLoader
+from sqlmesh.core.model.registry import ModelMetadata
 from sqlmesh.utils.errors import ConfigError
 
 
@@ -252,3 +253,45 @@ def test_streaming_mode_rejects_unbounded_python_model_loading(tmp_path: Path) -
             ),
             load_state=False,
         )
+
+
+def test_streaming_loader_returns_compact_worker_metadata(tmp_path: Path, monkeypatch) -> None:
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    for index in range(3):
+        (models_dir / f"model_{index}.sql").write_text(
+            f"MODEL (name test.model_{index}, kind FULL); SELECT {index} AS id"
+        )
+
+    discovered_batches = []
+    original = SqlMeshLoader._iter_sql_model_batches
+
+    def track_batches(self, *args, **kwargs):
+        for batch in original(self, *args, **kwargs):
+            discovered_batches.append(batch)
+            yield batch
+
+    monkeypatch.setattr(SqlMeshLoader, "_iter_sql_model_batches", track_batches)
+
+    context = Context(
+        paths=tmp_path,
+        config=Config(
+            model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+            planner=PlannerConfig(
+                mode=PlannerMode.STREAMING,
+                streaming_workers=2,
+                streaming_worker_max_tasks=1,
+            ),
+        ),
+        load_state=False,
+    )
+
+    assert len(discovered_batches) == 3
+    assert all(
+        isinstance(record, ModelMetadata)
+        for batch in discovered_batches
+        for record in batch
+    )
+    assert context.model_graph_index is not None
+    assert context.indexed_model_registry is not None
+    assert context.indexed_model_registry.cache_size == 0

@@ -1,4 +1,5 @@
 import sqlite3
+from concurrent.futures import Future
 from pathlib import Path
 
 import pytest
@@ -162,7 +163,13 @@ def test_streaming_schema_propagation_hydrates_only_child_and_one_parent(tmp_pat
     monkeypatch.setattr(
         "sqlmesh.core.model.schema._update_schema_with_model", fail_if_global_schema_is_updated
     )
-    max_hydrated = update_model_schemas_streaming(index, store, cache_dir=tmp_path, batch_size=1)
+    max_hydrated = update_model_schemas_streaming(
+        index,
+        store,
+        cache_dir=tmp_path,
+        batch_size=1,
+        max_workers=1,
+    )
 
     assert max_hydrated == 2
     finalized_b_metadata = index.metadata(model_b.fqn)
@@ -171,6 +178,125 @@ def test_streaming_schema_propagation_hydrates_only_child_and_one_parent(tmp_pat
     assert finalized_b is not None
     assert finalized_b.mapping_schema
     assert finalized_b.columns_to_types == model_a.columns_to_types
+
+
+def test_streaming_schema_propagation_uses_bounded_recycled_worker_pools(
+    tmp_path, monkeypatch
+):
+    models = [create_sql_model(f"db.model_{i}", parse_one(f"SELECT {i} AS id")) for i in range(5)]
+    index = ProjectGraphIndex(tmp_path / "graph.sqlite")
+    store = ModelPayloadStore(tmp_path / "payloads")
+    discovered = [
+        ModelMetadata.from_model(model, include_payload_digest=False) for model in models
+    ]
+    index.replace(discovered)
+    for model, metadata in zip(models, discovered):
+        store.put_discovered(model, metadata)
+
+    pools = []
+    events = []
+
+    class RecordingExecutor:
+        def __init__(self, initializer, initargs):
+            initializer(*initargs)
+            self.submitted = []
+            self.shutdown_called = False
+
+        def submit(self, function, name):
+            self.submitted.append(name)
+            events.append(("submit", name))
+            future = Future()
+            try:
+                future.set_result(function(name))
+            except BaseException as ex:
+                future.set_exception(ex)
+            return future
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_called = True
+
+    def create_recording_executor(*, initializer, initargs, max_workers):
+        assert max_workers == 2
+        executor = RecordingExecutor(initializer, initargs)
+        pools.append(executor)
+        return executor
+
+    original_update = index.update_payload_references
+
+    def record_update(records):
+        records = tuple(records)
+        events.append(("commit", tuple(sorted(record.fqn for record in records))))
+        original_update(records)
+
+    monkeypatch.setattr(
+        "sqlmesh.core.model.schema.create_process_pool_executor", create_recording_executor
+    )
+    monkeypatch.setattr(index, "update_payload_references", record_update)
+
+    max_hydrated = update_model_schemas_streaming(
+        index,
+        store,
+        cache_dir=tmp_path,
+        batch_size=5,
+        max_workers=2,
+        worker_max_tasks=1,
+    )
+
+    assert max_hydrated == 2
+    names = [model.fqn for model in models]
+    assert [pool.submitted for pool in pools] == [
+        names[0:2],
+        names[2:4],
+        names[4:5],
+    ]
+    assert all(pool.shutdown_called for pool in pools)
+    assert events == [
+        ("submit", names[0]),
+        ("submit", names[1]),
+        ("commit", tuple(names[0:2])),
+        ("submit", names[2]),
+        ("submit", names[3]),
+        ("commit", tuple(names[2:4])),
+        ("submit", names[4]),
+        ("commit", tuple(names[4:5])),
+    ]
+
+
+def test_streaming_schema_propagation_parallel_workers_respect_dependency_barriers(tmp_path):
+    model_a = create_sql_model("db.a", parse_one("SELECT 1 AS id"))
+    model_b = create_sql_model("db.b", parse_one("SELECT 2 AS id"))
+    model_c = create_sql_model(
+        "db.c", parse_one("SELECT * FROM db.a"), depends_on={model_a.fqn}
+    )
+    model_d = create_sql_model(
+        "db.d", parse_one("SELECT * FROM db.b"), depends_on={model_b.fqn}
+    )
+    models = (model_a, model_b, model_c, model_d)
+    index = ProjectGraphIndex(tmp_path / "graph.sqlite")
+    store = ModelPayloadStore(tmp_path / "payloads")
+    discovered = [
+        ModelMetadata.from_model(model, include_payload_digest=False) for model in models
+    ]
+    index.replace(discovered)
+    for model, metadata in zip(models, discovered):
+        store.put_discovered(model, metadata)
+
+    max_hydrated = update_model_schemas_streaming(
+        index,
+        store,
+        cache_dir=tmp_path,
+        batch_size=4,
+        max_workers=2,
+        worker_max_tasks=10,
+    )
+
+    assert max_hydrated == 4
+    finalized_c = store.get(index.metadata(model_c.fqn))
+    finalized_d = store.get(index.metadata(model_d.fqn))
+    assert finalized_c is not None
+    assert finalized_d is not None
+    assert finalized_c.columns_to_types == model_a.columns_to_types
+    assert finalized_d.columns_to_types == model_b.columns_to_types
 
 
 def test_indexed_metadata_selection_does_not_enumerate_model_records(tmp_path, monkeypatch):
@@ -190,7 +316,7 @@ def test_indexed_metadata_selection_does_not_enumerate_model_records(tmp_path, m
     assert MetadataSelector(registry).expand_model_selections(["tag:daily"]) == {"b"}
 
 
-def test_streaming_fingerprints_match_eager_with_bounded_hydration(tmp_path):
+def test_streaming_fingerprints_match_eager_without_model_hydration(tmp_path):
     model_a = create_sql_model("a", parse_one("SELECT 1 AS id"))
     model_b = create_sql_model("b", parse_one("SELECT * FROM a"), depends_on={model_a.fqn})
     model_c = create_sql_model("c", parse_one("SELECT * FROM b"), depends_on={model_b.fqn})
@@ -203,7 +329,9 @@ def test_streaming_fingerprints_match_eager_with_bounded_hydration(tmp_path):
         store.put(models[record.fqn], record)
     registry = IndexedModelRegistry(
         index,
-        lambda name: store.get(index.metadata(name)),
+        lambda name: (_ for _ in ()).throw(
+            AssertionError(f"fingerprinting hydrated model '{name}'")
+        ),
         max_entries=1,
     )
 
@@ -215,7 +343,7 @@ def test_streaming_fingerprints_match_eager_with_bounded_hydration(tmp_path):
     }
 
     assert streamed == expected
-    assert registry.max_cache_size_seen == 1
+    assert registry.max_cache_size_seen == 0
     assert registry.cache_size == 0
     assert index.fingerprint(model_c.fqn) == expected[model_c.fqn]
 

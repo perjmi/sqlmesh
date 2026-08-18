@@ -29,6 +29,9 @@ class ModelMetadata:
     dbt_fqn: t.Optional[str]
     payload_key: str = ""
     payload_digest: str = ""
+    data_hash: t.Optional[str] = None
+    metadata_hash: t.Optional[str] = None
+    python_env_imports: t.Tuple[str, ...] = ()
 
     @classmethod
     def from_model(cls, model: Model, *, include_payload_digest: bool = True) -> ModelMetadata:
@@ -48,6 +51,13 @@ class ModelMetadata:
             payload_digest=(
                 f"{model.data_hash}_{model.metadata_hash}" if include_payload_digest else ""
             ),
+            data_hash=model.data_hash if include_payload_digest else None,
+            metadata_hash=model.metadata_hash if include_payload_digest else None,
+            python_env_imports=tuple(
+                executable.payload
+                for executable in model.python_env.values()
+                if executable.kind == "import"
+            ),
         )
 
 
@@ -63,9 +73,10 @@ class StoredModelPayload:
 class ModelPayloadStore:
     """Versioned on-disk storage for independently hydrated model payloads."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, cleanup: bool = True) -> None:
+        self.path = path
         self._cache: FileCache[t.Union[Model, StoredModelPayload]] = FileCache(
-            path, prefix="model_payload"
+            path, prefix="model_payload", cleanup=cleanup
         )
 
     def put(self, model: Model, metadata: ModelMetadata) -> None:

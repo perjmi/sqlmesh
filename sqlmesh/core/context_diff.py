@@ -321,47 +321,54 @@ class ContextDiff(PydanticModel):
             )
         remote_by_name = {snapshot.name: snapshot for snapshot in environment_snapshot_infos}
 
-        local_names = set(snapshots)
+        store = snapshots.store
         removed = {
             snapshot_info.snapshot_id: snapshot_info
             for snapshot_info in environment_snapshot_infos
-            if snapshot_info.name not in local_names
+            if not store.contains_snapshot_name(snapshot_info.name)
         }
         added: t.Set[SnapshotId] = set()
         modified_info_by_name: t.Dict[str, SnapshotTableInfo] = {}
-        for name in snapshots:
-            snapshot = snapshots[name]
-            remote = remote_by_name.get(name)
+        for snapshot_id in store.iter_snapshot_ids():
+            remote = remote_by_name.get(snapshot_id.name)
             if remote is None:
-                added.add(snapshot.snapshot_id)
-            elif snapshot.fingerprint != remote.fingerprint:
-                modified_info_by_name[name] = remote
+                added.add(snapshot_id)
+            elif store.get_fingerprint(snapshot_id) != remote.fingerprint:
+                modified_info_by_name[snapshot_id.name] = remote
 
         modified_snapshots: t.Dict[str, t.Tuple[Snapshot, Snapshot]] = {}
-        store = snapshots.store
         batch_size = store.write_batch_size
-        names_batch: t.List[str] = []
+        snapshot_ids_batch: t.List[SnapshotId] = []
 
-        def merge_batch(names: t.Sequence[str]) -> None:
-            local_snapshots = [snapshots[name] for name in names]
+        def merge_batch(snapshot_ids: t.Sequence[SnapshotId]) -> None:
             merged_batch: t.List[t.Tuple[Snapshot, bool]] = []
-            requested: t.List[t.Union[Snapshot, SnapshotTableInfo]] = list(local_snapshots)
+            direct_new: t.List[SnapshotId] = []
+            requested: t.List[t.Union[SnapshotId, SnapshotTableInfo]] = list(snapshot_ids)
             requested.extend(
-                modified_info_by_name[snapshot.name]
-                for snapshot in local_snapshots
-                if snapshot.name in modified_info_by_name
+                modified_info_by_name[snapshot_id.name]
+                for snapshot_id in snapshot_ids
+                if snapshot_id.name in modified_info_by_name
             )
             stored = state_reader.get_snapshots(requested)
 
-            for local_snapshot in local_snapshots:
-                snapshot_id = local_snapshot.snapshot_id
-                modified_info = modified_info_by_name.get(local_snapshot.name)
+            for snapshot_id in snapshot_ids:
+                modified_info = modified_info_by_name.get(snapshot_id.name)
                 existing_snapshot = stored.get(snapshot_id)
+
+                if modified_info:
+                    local_snapshot = store.get_snapshot(snapshot_id)
+                elif existing_snapshot:
+                    local_snapshot = store.get_snapshot(snapshot_id)
+                else:
+                    direct_new.append(snapshot_id)
+                    continue
 
                 if modified_info and local_snapshot.node_type != modified_info.node_type:
                     added.add(snapshot_id)
                     removed[modified_info.snapshot_id] = modified_info
                     modified_info_by_name.pop(local_snapshot.name)
+                    direct_new.append(snapshot_id)
+                    continue
                 elif existing_snapshot:
                     existing_snapshot.node = local_snapshot.node
                     merged = existing_snapshot.copy()
@@ -381,15 +388,16 @@ class ContextDiff(PydanticModel):
                         stored[modified_info.snapshot_id],
                     )
                 merged_batch.append((merged, True))
+            store.mark_new(direct_new)
             store.put_snapshots(merged_batch)
 
-        for name in snapshots:
-            names_batch.append(name)
-            if len(names_batch) == batch_size:
-                merge_batch(names_batch)
-                names_batch = []
-        if names_batch:
-            merge_batch(names_batch)
+        for snapshot_id in store.iter_snapshot_ids():
+            snapshot_ids_batch.append(snapshot_id)
+            if len(snapshot_ids_batch) == batch_size:
+                merge_batch(snapshot_ids_batch)
+                snapshot_ids_batch = []
+        if snapshot_ids_batch:
+            merge_batch(snapshot_ids_batch)
 
         requirements = _build_requirements(
             provided_requirements or {},

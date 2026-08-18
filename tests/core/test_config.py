@@ -128,12 +128,19 @@ def test_update_with_model_defaults():
 
 
 def test_update_with_planner_config():
-    config_a = Config(planner=PlannerConfig(model_batch_size=25))
-    config_b = Config(planner=PlannerConfig(hydrated_snapshot_cache_size=50))
+    config_a = Config(planner=PlannerConfig(model_batch_size=25, streaming_workers=4))
+    config_b = Config(
+        planner=PlannerConfig(
+            hydrated_snapshot_cache_size=50,
+            streaming_worker_max_tasks=10,
+        )
+    )
 
     assert config_a.update_with(config_b).planner == PlannerConfig(
         model_batch_size=25,
         hydrated_snapshot_cache_size=50,
+        streaming_workers=4,
+        streaming_worker_max_tasks=10,
     )
 
 
@@ -143,6 +150,12 @@ def test_planner_config_rejects_invalid_bounds():
 
     with pytest.raises(ValueError, match="greater than or equal to 0"):
         PlannerConfig(hydrated_snapshot_cache_size=-1)
+
+    with pytest.raises(ValueError, match="greater than 0"):
+        PlannerConfig(streaming_workers=0)
+
+    with pytest.raises(ValueError, match="greater than 0"):
+        PlannerConfig(streaming_worker_max_tasks=0)
 
 
 def test_default_gateway():

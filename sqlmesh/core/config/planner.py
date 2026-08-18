@@ -26,6 +26,10 @@ class PlannerConfig(BaseConfig):
         hydrated_model_cache_size: Maximum number of hydrated models retained by a streaming registry.
         hydrated_snapshot_cache_size: Maximum number of snapshots retained by the state cache. ``None``
             preserves the eager planner's legacy unbounded cache.
+        streaming_workers: Maximum number of discovery, schema, and snapshot workers used by the
+            streaming planner. This is additionally capped by ``MAX_FORK_WORKERS``.
+        streaming_worker_max_tasks: Maximum number of models processed by each streaming worker
+            before the worker pool is recycled and its allocator state is released.
     """
 
     mode: PlannerMode = PlannerMode.EAGER
@@ -33,3 +37,5 @@ class PlannerConfig(BaseConfig):
     snapshot_batch_size: int = Field(default=10, gt=0)
     hydrated_model_cache_size: int = Field(default=250, ge=0)
     hydrated_snapshot_cache_size: t.Optional[int] = Field(default=None, ge=0)
+    streaming_workers: int = Field(default=2, gt=0)
+    streaming_worker_max_tasks: int = Field(default=25, gt=0)
