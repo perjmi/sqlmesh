@@ -79,7 +79,12 @@ metadata selection, streamed fingerprints, or the compact context diff disagree 
 
 Select a larger tier with `RANDOMGRAPHS_ACCURACY_TIER=pr`, `nightly`, or `stress`. To compare two
 implementations, set `REFERENCE_SQLMESH_IMAGE` and `CANDIDATE_SQLMESH_IMAGE` to their respective
-image tags.
+image tags. The candidate defaults to shadow mode; exercise the actual indexed-model cutover with:
+
+```bash
+CANDIDATE_PLANNER_MODE=streaming pytest -q -o addopts='' -p no:cacheprovider \
+  tests/test_dual_planner_accuracy.py
+```
 
 By default, each input table receives a deterministic random count of 10 to 1,000 rows. All
 tables use the same key sequence starting at `1`, so every join has matching records and every

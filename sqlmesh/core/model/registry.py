@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import typing as t
 from collections import OrderedDict
+from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -290,3 +291,59 @@ class IndexedModelRegistry:
     def evict(self, names: t.Iterable[str]) -> None:
         for name in names:
             self._cache.pop(name, None)
+
+
+class IndexedModelMapping(MutableMapping[str, Model]):
+    """Mutable compatibility mapping backed by bounded, on-demand model hydration.
+
+    Mutations remain process-local overrides. This keeps APIs such as ``upsert_model`` working
+    without rewriting the disposable project index mid-operation.
+    """
+
+    def __init__(self, registry: IndexedModelRegistry) -> None:
+        self._registry = registry
+        self._overrides: t.Dict[str, Model] = {}
+        self._deleted: t.Set[str] = set()
+
+    def __getitem__(self, name: str) -> Model:
+        if name in self._deleted:
+            raise KeyError(name)
+        if name in self._overrides:
+            return self._overrides[name]
+        if not self._registry.contains(name):
+            raise KeyError(name)
+        return self._registry.hydrate(name)
+
+    def __setitem__(self, name: str, model: Model) -> None:
+        self._deleted.discard(name)
+        self._overrides[name] = model
+        self._registry.evict((name,))
+
+    def __delitem__(self, name: str) -> None:
+        if name not in self:
+            raise KeyError(name)
+        self._overrides.pop(name, None)
+        self._deleted.add(name)
+        self._registry.evict((name,))
+
+    def __iter__(self) -> Iterator[str]:
+        for name in self._registry.iter_names():
+            if name not in self._deleted:
+                yield name
+        for name in sorted(self._overrides):
+            if not self._registry.contains(name):
+                yield name
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def metadata(self, name: str) -> ModelMetadata:
+        if name in self._overrides:
+            return ModelMetadata.from_model(self._overrides[name])
+        if name in self._deleted:
+            raise KeyError(name)
+        return self._registry.metadata(name)
+
+    def iter_metadata(self, names: t.Optional[t.Iterable[str]] = None) -> t.Iterator[ModelMetadata]:
+        for name in self if names is None else sorted(set(names)):
+            yield self.metadata(name)

@@ -86,6 +86,7 @@ from sqlmesh.core.metric import Metric, rewrite
 from sqlmesh.core.model import Model, update_model_schemas
 from sqlmesh.core.model.registry import (
     EagerModelRegistry,
+    IndexedModelMapping,
     IndexedModelRegistry,
     ModelMetadata,
     ModelPayloadStore,
@@ -408,7 +409,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         )
         self._projects = {config.project for config in self.configs.values()}
         self.dag: DAG[str] = DAG()
-        self._models: EagerModelRegistry = EagerModelRegistry()
+        self._models: t.Union[EagerModelRegistry, IndexedModelMapping] = EagerModelRegistry()
         self._audits: UniqueKeyDict[str, ModelAudit] = UniqueKeyDict("audits")
         self._standalone_audits: UniqueKeyDict[str, StandaloneAudit] = UniqueKeyDict(
             "standaloneaudits"
@@ -698,7 +699,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._standalone_audits.clear()
         self._audits.clear()
         self._macros.clear()
-        self._models.clear()
+        self._models = EagerModelRegistry()
         self._metrics.clear()
         self._requirements.clear()
         self._excluded_requirements.clear()
@@ -812,6 +813,11 @@ class GenericContext(BaseContext, t.Generic[C]):
             state_sync_fingerprint=self._scheduler.state_sync_fingerprint(self),
             project_name=self.config.project,
         )
+
+        if self.config.planner.mode == PlannerMode.STREAMING:
+            if self._indexed_model_registry is None:
+                raise SQLMeshError("Streaming model registry was not initialized")
+            self._models = IndexedModelMapping(self._indexed_model_registry)
 
         self._loaded = True
         return self

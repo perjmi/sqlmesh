@@ -60,7 +60,7 @@ services:
       POSTGRES_PASSWORD: postgres
       SQLMESH_CACHE_DIR: /tmp/sqlmesh-cache
       PYTHONDONTWRITEBYTECODE: 1
-      SQLMESH__PLANNER__MODE: shadow
+      SQLMESH__PLANNER__MODE: ${CANDIDATE_PLANNER_MODE:-shadow}
     depends_on:
       candidate_db:
         condition: service_healthy

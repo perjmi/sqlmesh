@@ -2616,6 +2616,45 @@ def test_eager_planner_does_not_create_model_graph_index(tmp_path):
     assert context.model_discovery_max_batch_size == 0
 
 
+def test_streaming_planner_releases_eager_models_after_load(tmp_path):
+    from sqlmesh.core.model.registry import IndexedModelMapping
+
+    models_path = tmp_path / "models"
+    models_path.mkdir()
+    (models_path / "a.sql").write_text("MODEL (name db.a); SELECT 1 AS id")
+    (models_path / "b.sql").write_text("MODEL (name db.b); SELECT * FROM db.a")
+    context = Context(
+        paths=[tmp_path],
+        config=Config(
+            model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+            planner=PlannerConfig(
+                mode=PlannerMode.STREAMING,
+                hydrated_model_cache_size=1,
+                model_batch_size=1,
+            ),
+        ),
+    )
+
+    assert isinstance(context._models, IndexedModelMapping)
+    assert context.indexed_model_registry is not None
+    assert context.model_graph_index is not None
+    assert context.indexed_model_registry.cache_size == 0
+    assert sorted(context.models) == sorted(context.model_graph_index.iter_names())
+
+    model_a = context.get_model("db.a")
+    assert model_a is not None
+    assert model_a.name == "db.a"
+    assert context.indexed_model_registry.cache_size == 1
+
+    plan = context.plan_builder("dev", skip_tests=True, skip_backfill=True).build()
+    assert {snapshot.name for snapshot in plan.new_snapshots} == set(context.models)
+    assert context.indexed_model_registry.cache_size <= 1
+
+    context.load()
+    assert isinstance(context._models, IndexedModelMapping)
+    assert context.indexed_model_registry.cache_size == 0
+
+
 def test_requirements(copy_to_temp_path: t.Callable):
     from sqlmesh.utils.metaprogramming import Executable
 

@@ -16,18 +16,21 @@ The branch currently implements the shadow-safe foundation and keeps eager appli
   the largest observed discovery batch is exposed for tests and diagnostics.
 - Versioned model payloads that preserve authoritative post-schema data and metadata hashes across
   serialization.
+- An indexed compatibility mapping in `streaming` mode that releases the eager project dictionary
+  after load and hydrates subsequent model access through the configured bounded LRU.
 - Topological, batch-bounded fingerprinting that persists results before model eviction.
 - A compact first-pass context diff based on snapshot headers.
 - Shadow checks for graph round-trips, selection, fingerprints, and context-diff change sets.
 - A two-Postgres random-graph oracle that runs eager reference plans against shadow candidates.
 
 The production streaming cutover is deliberately not claimed yet. Native SQL discovery now emits
-source-file batches into the graph transaction, but `Loader.load` and the public `Context.models`
-compatibility surface still retain those same models in the eager dictionary. Schema propagation still
-runs against that dictionary before final payload persistence. `ContextDiff`, `Plan`, and plan stages
-still retain full snapshot payloads, and streaming application/checkpoints remain delivery milestones D
-and E below. This boundary prevents an opt-in mode from silently applying mixed semantics before the
-remaining accuracy and failure-injection gates pass.
+source-file batches into the graph transaction. `Loader.load` still constructs an eager dictionary for
+schema propagation and validation, but `streaming` mode releases it after final payload persistence and
+serves later model access from the indexed mapping. APIs that explicitly iterate model values can still
+hydrate the complete project, and `ContextDiff`, `Plan`, and plan stages still retain full snapshot
+payloads. Streaming application/checkpoints remain delivery milestones D and E below. This boundary
+prevents an opt-in mode from silently applying mixed semantics before the remaining accuracy and
+failure-injection gates pass.
 
 ## Goals
 
@@ -72,7 +75,8 @@ snapshot, state-sync, plan-builder, evaluator, dbt, and engine integration suite
 `Loader.load` exposes native SQL results one source file at a time and the graph index consumes those
 batches transactionally. It still returns a `LoadedProject` containing the same fully hydrated `Model`
 instances. `Context.load` merges every project model into `_models`, builds the complete DAG, propagates
-mapping schemas, and validates every model before selection is applied.
+mapping schemas, and validates every model before selection is applied. In `streaming` mode the eager
+mapping is then released and replaced by an indexed, bounded-hydration compatibility mapping.
 
 ### Remote state
 
