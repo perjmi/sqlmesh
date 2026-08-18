@@ -23,6 +23,7 @@ from sqlmesh.core.plan.definition import (
     UserProvidedFlags,
     earliest_interval_start,
 )
+from sqlmesh.core.plan.store import IndexedSnapshotDAG, IndexedSnapshotMapping
 from sqlmesh.core.schema_diff import (
     get_schema_differ,
     has_drop_alteration,
@@ -200,7 +201,11 @@ class PlanBuilder:
             self._start = default_start or yesterday_ds()
 
         self._plan_id: str = random_id()
-        self._model_fqn_to_snapshot = {s.name: s for s in self._context_diff.snapshots.values()}
+        self._model_fqn_to_snapshot: t.Mapping[str, Snapshot]
+        if isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
+            self._model_fqn_to_snapshot = self._context_diff.snapshots.store.snapshots_by_name
+        else:
+            self._model_fqn_to_snapshot = {s.name: s for s in self._context_diff.snapshots.values()}
 
         self.override_start = start is not None
         self.override_end = end is not None
@@ -315,20 +320,19 @@ class PlanBuilder:
         self._adjust_snapshot_intervals()
 
         deployability_index = (
-            DeployabilityIndex.create(
-                self._context_diff.snapshots.values(),
-                start=self._start,
-                start_override_per_model=self._start_override_per_model,
-            )
+            self._build_deployability_index()
             if self._is_dev
             else DeployabilityIndex.all_deployable()
         )
 
         restatements = self._build_restatements(
             dag,
-            earliest_interval_start(self._context_diff.snapshots.values(), self.execution_time),
+            self._earliest_interval_start(),
         )
         models_to_backfill = self._build_models_to_backfill(dag, restatements)
+
+        if isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
+            self._context_diff.snapshots.store.flush()
 
         end_override_per_model = self._end_override_per_model
         if end_override_per_model and self.override_end:
@@ -380,10 +384,220 @@ class PlanBuilder:
         return plan
 
     def _build_dag(self) -> DAG[SnapshotId]:
+        if isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
+            return IndexedSnapshotDAG(
+                self._context_diff.snapshots.store,
+                batch_size=self._context_diff.snapshots.store.write_batch_size,
+            )
         dag: DAG[SnapshotId] = DAG()
         for s_id, context_snapshot in self._context_diff.snapshots.items():
             dag.add(s_id, context_snapshot.parents)
         return dag
+
+    def _build_deployability_index(self) -> DeployabilityIndex:
+        if not isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
+            return DeployabilityIndex.create(
+                self._context_diff.snapshots.values(),
+                start=self._start,
+                start_override_per_model=self._start_override_per_model,
+            )
+
+        store = self._context_diff.snapshots.store
+        start_overrides = self._start_override_per_model or {}
+        connection = store._connect()
+        try:
+            connection.execute(
+                """
+                CREATE TEMP TABLE deployability_state (
+                    name TEXT NOT NULL,
+                    identifier TEXT NOT NULL,
+                    start_ts INTEGER NOT NULL,
+                    deployable INTEGER NOT NULL,
+                    children_deployable INTEGER NOT NULL,
+                    representative INTEGER NOT NULL,
+                    PRIMARY KEY(name, identifier)
+                )
+                """
+            )
+            for snapshot_id in IndexedSnapshotDAG(store, store.write_batch_size):
+                snapshot = store.snapshots[snapshot_id]
+                parent_state = connection.execute(
+                    """
+                    SELECT MIN(state.start_ts) AS start_ts,
+                           MIN(state.children_deployable) AS children_deployable
+                    FROM snapshot_edges AS edge
+                    JOIN deployability_state AS state
+                      ON state.name = edge.parent_name
+                     AND state.identifier = edge.parent_identifier
+                    WHERE edge.child_name = ? AND edge.child_identifier = ?
+                    """,
+                    (snapshot_id.name, snapshot_id.identifier),
+                ).fetchone()
+
+                if snapshot.name in start_overrides:
+                    snapshot_start = start_overrides[snapshot.name]
+                elif snapshot.node.start:
+                    snapshot_start = to_datetime(snapshot.node.start)
+                elif parent_state["start_ts"] is not None:
+                    snapshot_start = to_datetime(parent_state["start_ts"])
+                else:
+                    snapshot_start = snapshot.node.cron_prev(snapshot.node.cron_floor(now()))
+
+                this_deployable = snapshot.virtual_environment_mode.is_full and (
+                    parent_state["children_deployable"] is None
+                    or bool(parent_state["children_deployable"])
+                )
+                representative = False
+                if this_deployable:
+                    is_forward_only_model = (
+                        snapshot.is_model
+                        and snapshot.model.forward_only
+                        and not snapshot.is_metadata
+                    )
+                    has_auto_restatement = (
+                        snapshot.is_model and snapshot.model.auto_restatement_cron is not None
+                    )
+                    is_valid_start = (
+                        snapshot.is_valid_start(self._start, snapshot_start)
+                        if self._start is not None
+                        else True
+                    )
+                    children_deployable = is_valid_start and not has_auto_restatement
+                    if (
+                        snapshot.is_forward_only
+                        or snapshot.is_indirect_non_breaking
+                        or is_forward_only_model
+                        or has_auto_restatement
+                        or not is_valid_start
+                    ):
+                        this_deployable = False
+                        if not snapshot.is_paused or (
+                            snapshot.is_indirect_non_breaking and snapshot.intervals
+                        ):
+                            representative = True
+                        else:
+                            children_deployable = False
+                else:
+                    children_deployable = False
+                    representative = not snapshot.is_paused
+
+                connection.execute(
+                    """
+                    INSERT INTO deployability_state(
+                        name, identifier, start_ts, deployable,
+                        children_deployable, representative
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id.name,
+                        snapshot_id.identifier,
+                        to_timestamp(snapshot_start),
+                        this_deployable,
+                        children_deployable,
+                        representative,
+                    ),
+                )
+
+            counts = connection.execute(
+                """
+                SELECT SUM(deployable) AS deployable, COUNT(*) AS total
+                FROM deployability_state
+                """
+            ).fetchone()
+            deployable_count = int(counts["deployable"] or 0)
+            total_count = int(counts["total"])
+            use_opposite = deployable_count > total_count - deployable_count
+            indexed_value = 0 if use_opposite else 1
+
+            indexed_ids = {
+                SnapshotId(name=row["name"], identifier=row["identifier"])
+                for row in connection.execute(
+                    """
+                    SELECT name, identifier FROM deployability_state
+                    WHERE deployable = ?
+                    """,
+                    (indexed_value,),
+                )
+            }
+            representative_ids = {
+                SnapshotId(name=row["name"], identifier=row["identifier"])
+                for row in connection.execute(
+                    """
+                    SELECT name, identifier FROM deployability_state
+                    WHERE representative = 1
+                    """
+                )
+            }
+            return DeployabilityIndex(
+                indexed_ids=indexed_ids,
+                is_opposite_index=use_opposite,
+                representative_shared_version_ids=representative_ids,
+            )
+        finally:
+            connection.close()
+
+    def _earliest_interval_start(self) -> datetime:
+        if not isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
+            return earliest_interval_start(
+                self._context_diff.snapshots.values(), self.execution_time
+            )
+
+        store = self._context_diff.snapshots.store
+        connection = store._connect()
+        earliest: t.Optional[datetime] = None
+        earliest_interval_ts: t.Optional[int] = None
+        try:
+            connection.execute(
+                """
+                CREATE TEMP TABLE snapshot_starts (
+                    name TEXT NOT NULL,
+                    identifier TEXT NOT NULL,
+                    start_ts INTEGER NOT NULL,
+                    PRIMARY KEY(name, identifier)
+                )
+                """
+            )
+            for snapshot_id in IndexedSnapshotDAG(store, store.write_batch_size):
+                snapshot = store.snapshots[snapshot_id]
+                parent_row = connection.execute(
+                    """
+                    SELECT MIN(starts.start_ts) AS start_ts
+                    FROM snapshot_edges AS edge
+                    JOIN snapshot_starts AS starts
+                      ON starts.name = edge.parent_name
+                     AND starts.identifier = edge.parent_identifier
+                    WHERE edge.child_name = ? AND edge.child_identifier = ?
+                    """,
+                    (snapshot_id.name, snapshot_id.identifier),
+                ).fetchone()
+                if snapshot.node.start:
+                    snapshot_start = to_datetime(snapshot.node.start)
+                elif parent_row["start_ts"] is not None:
+                    snapshot_start = to_datetime(parent_row["start_ts"])
+                else:
+                    snapshot_start = snapshot.node.cron_prev(
+                        snapshot.node.cron_floor(self.execution_time)
+                    )
+                connection.execute(
+                    "INSERT INTO snapshot_starts(name, identifier, start_ts) VALUES (?, ?, ?)",
+                    (snapshot_id.name, snapshot_id.identifier, to_timestamp(snapshot_start)),
+                )
+                earliest = snapshot_start if earliest is None else min(earliest, snapshot_start)
+                if snapshot.intervals:
+                    interval_ts = snapshot.intervals[0][0]
+                    earliest_interval_ts = (
+                        interval_ts
+                        if earliest_interval_ts is None
+                        else min(earliest_interval_ts, interval_ts)
+                    )
+        finally:
+            connection.close()
+
+        if earliest is None:
+            return to_datetime(yesterday_ds())
+        if earliest_interval_ts is not None:
+            return min(earliest, to_datetime(earliest_interval_ts))
+        return earliest
 
     def _build_restatements(
         self, dag: DAG[SnapshotId], earliest_interval_start: TimeLike
@@ -533,6 +747,9 @@ class PlanBuilder:
                 directly_modified.add(s_id)
 
         indirectly_modified: SnapshotMapping = defaultdict(set)
+        if not all_indirectly_modified:
+            return directly_modified, indirectly_modified
+
         for snapshot in directly_modified:
             for downstream_s_id in dag.downstream(snapshot.snapshot_id):
                 if downstream_s_id in all_indirectly_modified:
@@ -575,7 +792,9 @@ class PlanBuilder:
             if is_same_version and should_force_rebuild(old, new):
                 # If the difference between 2 snapshots requires a full rebuild,
                 # then clear the intervals for the new snapshot.
-                self._context_diff.snapshots[new.snapshot_id].intervals = []
+                current = self._context_diff.snapshots[new.snapshot_id]
+                current.intervals = []
+                self._save_streaming_snapshot(current)
             elif new.snapshot_id in self._context_diff.new_snapshots:
                 new.intervals = []
                 new.dev_intervals = []
@@ -583,6 +802,7 @@ class PlanBuilder:
                     new.merge_intervals(old)
                     if new.is_forward_only:
                         new.dev_intervals = new.intervals.copy()
+                self._save_streaming_snapshot(new)
 
     def _check_destructive_additive_changes(self, directly_modified: t.Set[SnapshotId]) -> None:
         for s_id in sorted(directly_modified):
@@ -672,12 +892,14 @@ class PlanBuilder:
 
             if s_id in self._choices:
                 snapshot.categorize_as(self._choices[s_id], forward_only)
+                self._save_streaming_snapshot(snapshot)
                 continue
 
             if s_id in self._context_diff.added:
                 snapshot.categorize_as(SnapshotChangeCategory.BREAKING, forward_only)
             elif s_id.name in self._context_diff.modified_snapshots:
                 self._categorize_snapshot(snapshot, forward_only, dag, indirectly_modified)
+            self._save_streaming_snapshot(snapshot)
 
     def _categorize_snapshot(
         self,
@@ -841,6 +1063,11 @@ class PlanBuilder:
                 and (not snapshot.full_history_restatement_only or not snapshot.is_incremental)
             ):
                 snapshot.effective_from = self._effective_from
+                self._save_streaming_snapshot(snapshot)
+
+    def _save_streaming_snapshot(self, snapshot: Snapshot) -> None:
+        if isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
+            self._context_diff.snapshots.store.save_snapshot(snapshot)
 
     def _is_forward_only_change(self, s_id: SnapshotId) -> bool:
         if not self._context_diff.directly_modified(

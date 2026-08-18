@@ -24,15 +24,22 @@ The branch currently implements the shadow-safe foundation and keeps eager appli
   the complete edge map during native streaming load, schema propagation, or fingerprinting.
 - Topological, batch-bounded fingerprinting that persists results before model eviction.
 - A compact first-pass context diff based on snapshot headers.
+- A per-plan SQLite snapshot catalog with bounded, write-back hydration, lazy ID/name/sequence views,
+  persisted snapshot edges, and disk-backed topological traversal.
+- Streaming context-diff merging and selected-plan snapshot generation that write complete snapshot
+  payloads directly to the plan catalog instead of constructing all-snapshot dictionaries.
+- SQLite-backed snapshot DAG traversal, deployability propagation, and earliest-start inference.
 - Shadow checks for graph round-trips, selection, fingerprints, and context-diff change sets.
 - A two-Postgres random-graph oracle that runs eager reference plans against shadow candidates.
 
 The production streaming cutover is deliberately not claimed yet. In `streaming` mode native SQL
 discovery emits and spills source-file batches without constructing a project-wide model dictionary.
 Schema propagation walks the indexed DAG and finalizes each model from its direct-parent column
-mappings. Later model access uses the indexed compatibility mapping. APIs that explicitly iterate model
-values can still hydrate the complete project, and `ContextDiff`, `Plan`, and plan stages still retain
-full snapshot payloads. Streaming application/checkpoints remain delivery milestones D and E below.
+mappings. Later model access uses the indexed compatibility mapping. Snapshot payloads in `ContextDiff`
+and `Plan` are now lazy views over the per-plan SQLite catalog, including the public indexable
+`Plan.new_snapshots` sequence. APIs that explicitly materialize model values remain outside the bound.
+Change-ID sets, modified old/new snapshot pairs, environment construction, and application stages still
+have eager retention points. Streaming application/checkpoints remain delivery milestones D and E below.
 This boundary prevents an opt-in mode from silently applying mixed semantics before the remaining
 accuracy and failure-injection gates pass.
 
@@ -100,8 +107,10 @@ snapshots. `CachingStateSync` retains requested snapshots in an unbounded proces
 
 ### Plan
 
-`ContextDiff`, `Plan`, and `PlanStagesBuilder` retain dictionaries containing complete `Snapshot`
-objects. Several stages duplicate all-snapshot mappings to support evaluation and promotion.
+The streaming `ContextDiff` and `Plan` snapshot collections are backed by a per-plan SQLite catalog and
+an entry-bounded hydration cache. The current change-ID sets and modified old/new pairs are still Python
+collections, while `PlanStagesBuilder`, evaluatable-plan conversion, environment construction, and
+several application stages can still materialize complete snapshot collections.
 
 ## Target architecture
 
@@ -228,7 +237,7 @@ The planner mode is explicit during development:
 planner:
   mode: eager       # eager | streaming
   model_batch_size: 100
-  snapshot_batch_size: 100
+  snapshot_batch_size: 10
   hydrated_model_cache_size: 250
   hydrated_snapshot_cache_size: 250
 ```

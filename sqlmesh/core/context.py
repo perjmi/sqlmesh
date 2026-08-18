@@ -59,6 +59,7 @@ from sqlmesh.core.audit import Audit, ModelAudit, StandaloneAudit
 from sqlmesh.core.config import (
     CategorizerConfig,
     Config,
+    TableNamingConvention,
     load_configs,
 )
 from sqlmesh.core.config.connection import ConnectionConfig
@@ -101,6 +102,11 @@ from sqlmesh.core.notification_target import (
 )
 from sqlmesh.core.plan import Plan, PlanBuilder, SnapshotIntervals, PlanExplainer
 from sqlmesh.core.plan.definition import UserProvidedFlags
+from sqlmesh.core.plan.store import (
+    IndexedSnapshotMapping,
+    IndexedSnapshotNameMapping,
+    SnapshotPlanStore,
+)
 from sqlmesh.core.reference import ReferenceGraph
 from sqlmesh.core.scheduler import Scheduler, CompletionStatus
 from sqlmesh.core.schema_loader import create_external_models_file
@@ -110,6 +116,8 @@ from sqlmesh.core.snapshot import (
     Snapshot,
     SnapshotEvaluator,
     SnapshotFingerprint,
+    SnapshotId,
+    SnapshotTableInfo,
     missing_intervals,
     to_table_mapping,
 )
@@ -130,7 +138,7 @@ from sqlmesh.core.test import (
     filter_tests_by_patterns,
 )
 from sqlmesh.core.user import User
-from sqlmesh.utils import CorrelationId, UniqueKeyDict, Verbosity
+from sqlmesh.utils import CorrelationId, UniqueKeyDict, Verbosity, random_id
 from sqlmesh.utils.concurrency import concurrent_apply_to_values
 from sqlmesh.utils.dag import DAG
 from sqlmesh.utils.date import (
@@ -434,6 +442,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._model_graph_index: t.Optional[ProjectGraphIndex] = None
         self._indexed_model_registry: t.Optional[IndexedModelRegistry] = None
         self._compact_context_diff: t.Optional[CompactContextDiff] = None
+        self._active_plan_store: t.Optional[SnapshotPlanStore] = None
         self._model_discovery_max_batch_size = 0
         self._model_schema_max_hydrated = 0
 
@@ -646,9 +655,12 @@ class GenericContext(BaseContext, t.Generic[C]):
                 self.console.log_status_update("Initializing new project state...")
                 self._state_sync.migrate()
             self._state_sync.get_versions()
+            snapshot_cache_size = self.config.planner.hydrated_snapshot_cache_size
+            if snapshot_cache_size is None and self.config.planner.mode == PlannerMode.STREAMING:
+                snapshot_cache_size = 1
             self._state_sync = CachingStateSync(  # type: ignore
                 self._state_sync,
-                max_entries=self.config.planner.hydrated_snapshot_cache_size,
+                max_entries=snapshot_cache_size,
             )
         return self._state_sync
 
@@ -1323,7 +1335,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         If one of the snapshots has been previously stored in the persisted state, the stored
         instance will be returned.
         """
-        return self._snapshots()
+        return t.cast(t.Dict[str, Snapshot], self._snapshots())
 
     @property
     def requirements(self) -> t.Dict[str, str]:
@@ -1957,7 +1969,20 @@ class GenericContext(BaseContext, t.Generic[C]):
                 }
 
             # Refresh snapshot intervals to ensure that they are up to date with values reflected in the max_interval_end_per_model.
-            self.state_sync.refresh_snapshot_intervals(context_diff.snapshots.values())
+            if isinstance(context_diff.snapshots, IndexedSnapshotMapping):
+                store = context_diff.snapshots.store
+                snapshot_batch: t.List[Snapshot] = []
+                for snapshot in context_diff.snapshots.values():
+                    snapshot_batch.append(snapshot)
+                    if len(snapshot_batch) == self.config.planner.snapshot_batch_size:
+                        self.state_sync.refresh_snapshot_intervals(snapshot_batch)
+                        store.save_snapshots(snapshot_batch)
+                        snapshot_batch = []
+                if snapshot_batch:
+                    self.state_sync.refresh_snapshot_intervals(snapshot_batch)
+                    store.save_snapshots(snapshot_batch)
+            else:
+                self.state_sync.refresh_snapshot_intervals(context_diff.snapshots.values())
 
         start_override_per_model = self._calculate_start_override_per_model(
             min_intervals,
@@ -3145,7 +3170,97 @@ class GenericContext(BaseContext, t.Generic[C]):
 
     def _snapshots(
         self, models_override: t.Optional[UniqueKeyDict[str, Model]] = None
-    ) -> t.Dict[str, Snapshot]:
+    ) -> t.Union[t.Dict[str, Snapshot], IndexedSnapshotNameMapping]:
+        if self.config.planner.mode == PlannerMode.STREAMING:
+            if self._standalone_audits:
+                raise SQLMeshError(
+                    "SQLite-backed streaming snapshots do not yet support standalone audits"
+                )
+            if self._model_graph_index is None or self._indexed_model_registry is None:
+                raise SQLMeshError("Streaming model graph was not initialized")
+
+            snapshot_cache_size = self.config.planner.hydrated_snapshot_cache_size
+            if snapshot_cache_size is None:
+                snapshot_cache_size = 1
+            store = SnapshotPlanStore(
+                self.cache_dir / "plans" / f"plan_{random_id()}.sqlite",
+                max_cached_snapshots=snapshot_cache_size,
+                write_batch_size=self.config.planner.snapshot_batch_size,
+            )
+            self._active_plan_store = store
+            created_ts = now_timestamp()
+            index = self._model_graph_index
+            registry = self._indexed_model_registry
+            if models_override is not None:
+                fingerprint_cache: t.Dict[str, SnapshotFingerprint] = {}
+                selected_snapshot_batch: t.List[t.Tuple[Snapshot, bool]] = []
+                for node in models_override.values():
+                    selected_snapshot_kwargs: t.Dict[str, t.Any] = {}
+                    if node.project in self._projects:
+                        config = self.config_for_node(node)
+                        selected_snapshot_kwargs["ttl"] = config.snapshot_ttl
+                        selected_snapshot_kwargs["table_naming_convention"] = (
+                            config.physical_table_naming_convention
+                        )
+                    selected_snapshot_batch.append(
+                        (
+                            Snapshot.from_node(
+                                node,
+                                nodes=t.cast(t.Dict[str, t.Any], models_override),
+                                cache=fingerprint_cache,
+                                **selected_snapshot_kwargs,
+                            ),
+                            False,
+                        )
+                    )
+                    if len(selected_snapshot_batch) == self.config.planner.snapshot_batch_size:
+                        store.put_snapshots(selected_snapshot_batch)
+                        selected_snapshot_batch = []
+                if selected_snapshot_batch:
+                    store.put_snapshots(selected_snapshot_batch)
+                return store.snapshots_by_name
+
+            for names in index.iter_topological_batches(self.config.planner.snapshot_batch_size):
+                indexed_snapshot_batch: t.List[t.Tuple[Snapshot, bool]] = []
+                try:
+                    for name in names:
+                        node = registry.hydrate(name)
+                        indexed_snapshot_kwargs: t.Dict[str, t.Any] = {}
+                        if node.project in self._projects:
+                            config = self.config_for_node(node)
+                            indexed_snapshot_kwargs["ttl"] = config.snapshot_ttl
+                            indexed_snapshot_kwargs["table_naming_convention"] = (
+                                config.physical_table_naming_convention
+                            )
+
+                        metadata = index.metadata(name)
+                        snapshot = Snapshot(
+                            name=node.fqn,
+                            fingerprint=index.fingerprint(name),
+                            node=node,
+                            parents=tuple(
+                                SnapshotId(
+                                    name=parent,
+                                    identifier=index.fingerprint(parent).to_identifier(),
+                                )
+                                for parent in metadata.dependencies
+                                if index.contains(parent)
+                            ),
+                            intervals=[],
+                            dev_intervals=[],
+                            created_ts=created_ts,
+                            updated_ts=created_ts,
+                            ttl=indexed_snapshot_kwargs.get("ttl", c.DEFAULT_SNAPSHOT_TTL),
+                            table_naming_convention=indexed_snapshot_kwargs.get(
+                                "table_naming_convention", TableNamingConvention.default
+                            ),
+                        )
+                        indexed_snapshot_batch.append((snapshot, False))
+                    store.put_snapshots(indexed_snapshot_batch)
+                finally:
+                    registry.evict(names)
+            return store.snapshots_by_name
+
         nodes = {**(models_override or self._models), **self._standalone_audits}
         snapshots = self._nodes_to_snapshots(nodes)
         stored_snapshots = self.state_reader.get_snapshots(snapshots.values())
@@ -3160,8 +3275,8 @@ class GenericContext(BaseContext, t.Generic[C]):
                 logger.info(
                     "Found a unrestorable snapshot %s. Restamping the model...", snapshot.name
                 )
-                node = nodes[snapshot.name]
-                nodes[snapshot.name] = node.copy(
+                unrestorable_node = nodes[snapshot.name]
+                nodes[snapshot.name] = unrestorable_node.copy(
                     update={"stamp": f"revert to {snapshot.identifier}"}
                 )
             snapshots = self._nodes_to_snapshots(nodes)
@@ -3176,7 +3291,7 @@ class GenericContext(BaseContext, t.Generic[C]):
     def _context_diff(
         self,
         environment: str,
-        snapshots: t.Optional[t.Dict[str, Snapshot]] = None,
+        snapshots: t.Optional[t.Mapping[str, Snapshot]] = None,
         create_from: t.Optional[str] = None,
         force_no_diff: bool = False,
         ensure_finalized_snapshots: bool = False,
@@ -3212,7 +3327,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             else:
                 comparison_environment = existing_environment
 
-            environment_snapshots = ()
+            environment_snapshots: t.Iterable[SnapshotTableInfo] = ()
             if comparison_environment is not None:
                 environment_snapshots = (
                     comparison_environment.finalized_or_current_snapshots
@@ -3540,7 +3655,7 @@ class GenericContext(BaseContext, t.Generic[C]):
 
     def _get_plan_default_start_end(
         self,
-        snapshots: t.Dict[str, Snapshot],
+        snapshots: t.Mapping[str, Snapshot],
         max_interval_end_per_model: t.Dict[str, datetime],
         backfill_models: t.Optional[t.Set[str]],
         modified_model_names: t.Set[str],
@@ -3592,7 +3707,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         plan_end: t.Optional[TimeLike],
         plan_execution_time: TimeLike,
         backfill_model_fqns: t.Optional[t.Set[str]],
-        snapshots_by_model_fqn: t.Dict[str, Snapshot],
+        snapshots_by_model_fqn: t.Mapping[str, Snapshot],
         end_override_per_model: t.Optional[t.Dict[str, datetime]],
     ) -> t.Dict[str, datetime]:
         if not min_intervals or not backfill_model_fqns or not plan_start:
@@ -3665,7 +3780,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         return start_overrides
 
     def _get_max_interval_end_per_model(
-        self, snapshots: t.Dict[str, Snapshot], backfill_models: t.Optional[t.Set[str]]
+        self, snapshots: t.Mapping[str, Snapshot], backfill_models: t.Optional[t.Set[str]]
     ) -> t.Dict[str, datetime]:
         models_for_interval_end = (
             self._get_models_for_interval_end(snapshots, backfill_models)
@@ -3683,7 +3798,7 @@ class GenericContext(BaseContext, t.Generic[C]):
 
     @staticmethod
     def _get_models_for_interval_end(
-        snapshots: t.Dict[str, Snapshot], backfill_models: t.Set[str]
+        snapshots: t.Mapping[str, Snapshot], backfill_models: t.Set[str]
     ) -> t.Set[str]:
         models_for_interval_end = set()
         models_stack = list(backfill_models)

@@ -9,6 +9,7 @@ from pydantic import Field
 
 from sqlmesh.core.context_diff import ContextDiff
 from sqlmesh.core.environment import Environment, EnvironmentNamingInfo, EnvironmentStatements
+from sqlmesh.core.plan.store import IndexedSnapshotMapping, IndexedSnapshotSequence
 from sqlmesh.utils.metaprogramming import Executable  # noqa
 from sqlmesh.core.node import IntervalUnit
 from sqlmesh.core.snapshot import (
@@ -149,7 +150,7 @@ class Plan(PydanticModel, frozen=True):
         ]
 
     @property
-    def snapshots(self) -> t.Dict[SnapshotId, Snapshot]:
+    def snapshots(self) -> t.Mapping[SnapshotId, Snapshot]:
         return self.context_diff.snapshots
 
     @cached_property
@@ -175,8 +176,10 @@ class Plan(PydanticModel, frozen=True):
         }
 
     @property
-    def new_snapshots(self) -> t.List[Snapshot]:
+    def new_snapshots(self) -> t.Sequence[Snapshot]:
         """Gets only new snapshots in the plan/environment."""
+        if isinstance(self.context_diff.new_snapshots, IndexedSnapshotMapping):
+            return IndexedSnapshotSequence(self.context_diff.new_snapshots.store)
         return list(self.context_diff.new_snapshots.values())
 
     @property

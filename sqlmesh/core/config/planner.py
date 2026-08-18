@@ -30,6 +30,6 @@ class PlannerConfig(BaseConfig):
 
     mode: PlannerMode = PlannerMode.EAGER
     model_batch_size: int = Field(default=100, gt=0)
-    snapshot_batch_size: int = Field(default=100, gt=0)
+    snapshot_batch_size: int = Field(default=10, gt=0)
     hydrated_model_cache_size: int = Field(default=250, ge=0)
     hydrated_snapshot_cache_size: t.Optional[int] = Field(default=None, ge=0)

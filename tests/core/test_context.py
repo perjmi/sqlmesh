@@ -2619,6 +2619,7 @@ def test_eager_planner_does_not_create_model_graph_index(tmp_path):
 def test_streaming_planner_releases_eager_models_after_load(tmp_path):
     from sqlmesh.core.model.graph import IndexedDAG
     from sqlmesh.core.model.registry import IndexedModelMapping
+    from sqlmesh.core.plan.store import IndexedSnapshotMapping
 
     models_path = tmp_path / "models"
     models_path.mkdir()
@@ -2631,6 +2632,7 @@ def test_streaming_planner_releases_eager_models_after_load(tmp_path):
             planner=PlannerConfig(
                 mode=PlannerMode.STREAMING,
                 hydrated_model_cache_size=1,
+                hydrated_snapshot_cache_size=1,
                 model_batch_size=1,
             ),
         ),
@@ -2654,8 +2656,17 @@ def test_streaming_planner_releases_eager_models_after_load(tmp_path):
     assert model_b is not None
     assert context.dag.upstream(model_b.fqn) == {model_a.fqn}
 
+    selected_plan = context.plan_builder(
+        "selected", select_models=["db.a"], skip_tests=True, skip_backfill=True
+    ).build()
+    assert [snapshot.name for snapshot in selected_plan.new_snapshots] == [model_a.fqn]
+
     plan = context.plan_builder("dev", skip_tests=True, skip_backfill=True).build()
+    assert isinstance(plan.context_diff.snapshots, IndexedSnapshotMapping)
+    assert isinstance(plan.context_diff.new_snapshots, IndexedSnapshotMapping)
+    assert plan.context_diff.snapshots.store.cache_size <= 1
     assert {snapshot.name for snapshot in plan.new_snapshots} == set(context.models)
+    assert all(plan.deployability_index.is_deployable(snapshot) for snapshot in plan.new_snapshots)
     assert context.indexed_model_registry.cache_size <= 1
 
     context.load()

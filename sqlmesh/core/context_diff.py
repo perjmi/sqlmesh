@@ -16,6 +16,7 @@ import sys
 import typing as t
 from difflib import ndiff, unified_diff
 from functools import cached_property
+from pydantic import SkipValidation
 from sqlmesh.core import constants as c
 from sqlmesh.core.console import get_console
 from sqlmesh.core.macros import RuntimeStage
@@ -31,6 +32,7 @@ else:
 
 
 if t.TYPE_CHECKING:
+    from sqlmesh.core.plan.store import IndexedSnapshotNameMapping
     from sqlmesh.core.state_sync import StateReader
 
 from sqlmesh.utils.metaprogramming import Executable  # noqa
@@ -68,9 +70,9 @@ class ContextDiff(PydanticModel):
     """Deleted nodes."""
     modified_snapshots: t.Dict[str, t.Tuple[Snapshot, Snapshot]]
     """Modified snapshots."""
-    snapshots: t.Dict[SnapshotId, Snapshot]
+    snapshots: SkipValidation[t.Mapping[SnapshotId, Snapshot]]
     """Merged snapshots."""
-    new_snapshots: t.Dict[SnapshotId, Snapshot]
+    new_snapshots: SkipValidation[t.Mapping[SnapshotId, Snapshot]]
     """New snapshots."""
     previous_plan_id: t.Optional[str]
     """Previous plan id."""
@@ -93,7 +95,7 @@ class ContextDiff(PydanticModel):
     def create(
         cls,
         environment: str,
-        snapshots: t.Dict[str, Snapshot],
+        snapshots: t.Mapping[str, Snapshot],
         create_from: str,
         state_reader: StateReader,
         ensure_finalized_snapshots: bool = False,
@@ -128,6 +130,24 @@ class ContextDiff(PydanticModel):
         Returns:
             The ContextDiff object.
         """
+        from sqlmesh.core.plan.store import IndexedSnapshotNameMapping
+
+        if isinstance(snapshots, IndexedSnapshotNameMapping):
+            return cls._create_streaming(
+                environment=environment,
+                snapshots=snapshots,
+                create_from=create_from,
+                state_reader=state_reader,
+                ensure_finalized_snapshots=ensure_finalized_snapshots,
+                provided_requirements=provided_requirements,
+                excluded_requirements=excluded_requirements,
+                diff_rendered=diff_rendered,
+                environment_statements=environment_statements,
+                gateway_managed_virtual_layer=gateway_managed_virtual_layer,
+                infer_python_dependencies=infer_python_dependencies,
+                always_recreate_environment=always_recreate_environment,
+            )
+
         environment = environment.lower()
         existing_env = state_reader.get_environment(environment)
         create_from_env_exists = False
@@ -256,6 +276,163 @@ class ContextDiff(PydanticModel):
         )
 
     @classmethod
+    def _create_streaming(
+        cls,
+        *,
+        environment: str,
+        snapshots: IndexedSnapshotNameMapping,
+        create_from: str,
+        state_reader: StateReader,
+        ensure_finalized_snapshots: bool,
+        provided_requirements: t.Optional[t.Dict[str, str]],
+        excluded_requirements: t.Optional[t.Set[str]],
+        diff_rendered: bool,
+        environment_statements: t.Optional[t.List[EnvironmentStatements]],
+        gateway_managed_virtual_layer: bool,
+        infer_python_dependencies: bool,
+        always_recreate_environment: bool,
+    ) -> ContextDiff:
+        """Builds a context diff while keeping the complete snapshot catalog in SQLite."""
+        environment = environment.lower()
+        existing_env = state_reader.get_environment(environment)
+        recreate_environment = always_recreate_environment and environment != create_from
+
+        if existing_env is None or existing_env.expired or recreate_environment:
+            env = state_reader.get_environment(create_from.lower())
+            if not env and create_from != c.PROD:
+                get_console().log_warning(
+                    f"The environment name '{create_from}' was passed to the `plan` command's "
+                    f"`--create-from` argument, but '{create_from}' does not exist. Initializing "
+                    f"new environment '{environment}' from scratch."
+                )
+            is_new_environment = True
+            create_from_env_exists = env is not None
+            previously_promoted_snapshot_ids: t.Set[SnapshotId] = set()
+        else:
+            env = existing_env
+            is_new_environment = False
+            create_from_env_exists = False
+            previously_promoted_snapshot_ids = {s.snapshot_id for s in env.promoted_snapshots}
+
+        environment_snapshot_infos = []
+        if env:
+            environment_snapshot_infos = (
+                env.finalized_or_current_snapshots if ensure_finalized_snapshots else env.snapshots
+            )
+        remote_by_name = {snapshot.name: snapshot for snapshot in environment_snapshot_infos}
+
+        local_names = set(snapshots)
+        removed = {
+            snapshot_info.snapshot_id: snapshot_info
+            for snapshot_info in environment_snapshot_infos
+            if snapshot_info.name not in local_names
+        }
+        added: t.Set[SnapshotId] = set()
+        modified_info_by_name: t.Dict[str, SnapshotTableInfo] = {}
+        for name in snapshots:
+            snapshot = snapshots[name]
+            remote = remote_by_name.get(name)
+            if remote is None:
+                added.add(snapshot.snapshot_id)
+            elif snapshot.fingerprint != remote.fingerprint:
+                modified_info_by_name[name] = remote
+
+        modified_snapshots: t.Dict[str, t.Tuple[Snapshot, Snapshot]] = {}
+        store = snapshots.store
+        batch_size = store.write_batch_size
+        names_batch: t.List[str] = []
+
+        def merge_batch(names: t.Sequence[str]) -> None:
+            local_snapshots = [snapshots[name] for name in names]
+            merged_batch: t.List[t.Tuple[Snapshot, bool]] = []
+            requested: t.List[t.Union[Snapshot, SnapshotTableInfo]] = list(local_snapshots)
+            requested.extend(
+                modified_info_by_name[snapshot.name]
+                for snapshot in local_snapshots
+                if snapshot.name in modified_info_by_name
+            )
+            stored = state_reader.get_snapshots(requested)
+
+            for local_snapshot in local_snapshots:
+                snapshot_id = local_snapshot.snapshot_id
+                modified_info = modified_info_by_name.get(local_snapshot.name)
+                existing_snapshot = stored.get(snapshot_id)
+
+                if modified_info and local_snapshot.node_type != modified_info.node_type:
+                    added.add(snapshot_id)
+                    removed[modified_info.snapshot_id] = modified_info
+                    modified_info_by_name.pop(local_snapshot.name)
+                elif existing_snapshot:
+                    existing_snapshot.node = local_snapshot.node
+                    merged = existing_snapshot.copy()
+                    if modified_info:
+                        modified_snapshots[local_snapshot.name] = (
+                            existing_snapshot,
+                            stored[modified_info.snapshot_id],
+                        )
+                    merged_batch.append((merged, False))
+                    continue
+
+                merged = local_snapshot.copy()
+                if modified_info:
+                    merged.previous_versions = modified_info.all_versions
+                    modified_snapshots[local_snapshot.name] = (
+                        merged,
+                        stored[modified_info.snapshot_id],
+                    )
+                merged_batch.append((merged, True))
+            store.put_snapshots(merged_batch)
+
+        for name in snapshots:
+            names_batch.append(name)
+            if len(names_batch) == batch_size:
+                merge_batch(names_batch)
+                names_batch = []
+        if names_batch:
+            merge_batch(names_batch)
+
+        requirements = _build_requirements(
+            provided_requirements or {},
+            excluded_requirements or set(),
+            store.snapshots.values(),
+            infer_python_dependencies=infer_python_dependencies,
+        )
+        previous_environment_statements = (
+            state_reader.get_environment_statements(env.name) if env else []
+        )
+        previous_plan_id = (
+            existing_env.plan_id
+            if existing_env and always_recreate_environment
+            else env.plan_id
+            if env and not is_new_environment
+            else None
+        )
+
+        return ContextDiff(
+            environment=environment,
+            is_new_environment=is_new_environment,
+            is_unfinalized_environment=bool(env and not env.finalized_ts),
+            normalize_environment_name=is_new_environment or bool(env and env.normalize_name),
+            create_from=create_from,
+            create_from_env_exists=create_from_env_exists,
+            added=added,
+            removed_snapshots=removed,
+            modified_snapshots=modified_snapshots,
+            snapshots=store.snapshots,
+            new_snapshots=store.new_snapshots,
+            previous_plan_id=previous_plan_id,
+            previously_promoted_snapshot_ids=previously_promoted_snapshot_ids,
+            previous_finalized_snapshots=env.previous_finalized_snapshots if env else None,
+            previous_requirements=env.requirements if env else {},
+            requirements=requirements,
+            diff_rendered=diff_rendered,
+            previous_environment_statements=previous_environment_statements,
+            environment_statements=environment_statements or [],
+            previous_gateway_managed_virtual_layer=env.gateway_managed if env else False,
+            gateway_managed_virtual_layer=gateway_managed_virtual_layer,
+        )
+
+    @classmethod
     def create_no_diff(cls, environment: str, state_reader: StateReader) -> ContextDiff:
         """Create a no-op ContextDiff object.
 
@@ -350,7 +527,13 @@ class ContextDiff(PydanticModel):
         return {current.snapshot_id for current, _ in self.modified_snapshots.values()}
 
     @cached_property
-    def snapshots_by_name(self) -> t.Dict[str, Snapshot]:
+    def snapshots_by_name(
+        self,
+    ) -> t.Mapping[str, Snapshot]:
+        from sqlmesh.core.plan.store import IndexedSnapshotMapping
+
+        if isinstance(self.snapshots, IndexedSnapshotMapping):
+            return self.snapshots.store.snapshots_by_name
         return {x.name: x for x in self.snapshots.values()}
 
     def requirements_diff(self) -> str:
