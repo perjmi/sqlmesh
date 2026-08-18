@@ -63,6 +63,7 @@ from sqlmesh.core.config import (
 )
 from sqlmesh.core.config.connection import ConnectionConfig
 from sqlmesh.core.config.loader import C
+from sqlmesh.core.config.planner import PlannerMode
 from sqlmesh.core.config.root import RegexKeyDict
 from sqlmesh.core.console import get_console
 from sqlmesh.core.context_diff import ContextDiff
@@ -82,6 +83,8 @@ from sqlmesh.core.linter.rules import BUILTIN_RULES
 from sqlmesh.core.macros import ExecutableOrMacro, macro
 from sqlmesh.core.metric import Metric, rewrite
 from sqlmesh.core.model import Model, update_model_schemas
+from sqlmesh.core.model.registry import EagerModelRegistry
+from sqlmesh.core.model.graph import ProjectGraphIndex
 from sqlmesh.core.config.model import ModelDefaultsConfig
 from sqlmesh.core.notification_target import (
     NotificationEvent,
@@ -398,7 +401,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         )
         self._projects = {config.project for config in self.configs.values()}
         self.dag: DAG[str] = DAG()
-        self._models: UniqueKeyDict[str, Model] = UniqueKeyDict("models")
+        self._models: EagerModelRegistry = EagerModelRegistry()
         self._audits: UniqueKeyDict[str, ModelAudit] = UniqueKeyDict("audits")
         self._standalone_audits: UniqueKeyDict[str, StandaloneAudit] = UniqueKeyDict(
             "standaloneaudits"
@@ -419,6 +422,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._loaded: bool = False
         self._load_state: bool = load_state
         self._selector_cls = selector or NativeSelector
+        self._model_graph_index: t.Optional[ProjectGraphIndex] = None
 
         self.path, self.config = t.cast(t.Tuple[Path, C], next(iter(self.configs.items())))
 
@@ -629,7 +633,10 @@ class GenericContext(BaseContext, t.Generic[C]):
                 self.console.log_status_update("Initializing new project state...")
                 self._state_sync.migrate()
             self._state_sync.get_versions()
-            self._state_sync = CachingStateSync(self._state_sync)  # type: ignore
+            self._state_sync = CachingStateSync(  # type: ignore
+                self._state_sync,
+                max_entries=self.config.planner.hydrated_snapshot_cache_size,
+            )
         return self._state_sync
 
     @property
@@ -751,6 +758,8 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._all_dialects = {m.dialect for m in self._models.values() if m.dialect} | {
             self.default_dialect or ""
         }
+
+        self._refresh_model_graph_index()
 
         analytics.collector.on_project_loaded(
             project_type=self._project_type,
@@ -1088,6 +1097,25 @@ class GenericContext(BaseContext, t.Generic[C]):
     def models(self) -> MappingProxyType[str, Model]:
         """Returns all registered models in this context."""
         return MappingProxyType(self._models)
+
+    @property
+    def model_graph_index(self) -> t.Optional[ProjectGraphIndex]:
+        """Returns the compact project graph used by shadow and streaming planners."""
+        return self._model_graph_index
+
+    def _refresh_model_graph_index(self) -> None:
+        if self.config.planner.mode == PlannerMode.EAGER:
+            self._model_graph_index = None
+            return
+
+        index = ProjectGraphIndex(self.cache_dir / "model_graph.sqlite")
+        index.replace(self._models.iter_metadata())
+
+        eager_metadata = tuple(self._models.iter_metadata())
+        indexed_metadata = tuple(index.iter_metadata())
+        if indexed_metadata != eager_metadata:
+            raise SQLMeshError("The indexed model graph does not match the eagerly loaded project graph")
+        self._model_graph_index = index
 
     @property
     def metrics(self) -> MappingProxyType[str, Metric]:

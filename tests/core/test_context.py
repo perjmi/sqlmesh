@@ -29,6 +29,8 @@ from sqlmesh.core.config import (
     LinterConfig,
     ModelDefaultsConfig,
     PlanConfig,
+    PlannerConfig,
+    PlannerMode,
     SnowflakeConnectionConfig,
 )
 from sqlmesh.core.context import Context
@@ -2550,6 +2552,53 @@ def test_duckdb_state_connection_automatic_multithreaded_mode(tmp_path):
     assert isinstance(state_sync, EngineAdapterStateSync)
     assert isinstance(state_sync.engine_adapter, DuckDBEngineAdapter)
     assert isinstance(state_sync.engine_adapter._connection_pool, ThreadLocalSharedConnectionPool)
+
+
+def test_state_sync_uses_planner_snapshot_cache_bound(tmp_path):
+    context = Context(
+        paths=[tmp_path],
+        config=Config(
+            model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+            planner=PlannerConfig(hydrated_snapshot_cache_size=17),
+        ),
+    )
+
+    assert isinstance(context.state_sync, CachingStateSync)
+    assert context.state_sync.max_entries == 17
+
+
+def test_shadow_planner_persists_complete_model_graph(tmp_path):
+    models_path = tmp_path / "models"
+    models_path.mkdir()
+    (models_path / "a.sql").write_text(
+        "MODEL (name db.a, tags [daily]); SELECT 1 AS id", encoding="utf-8"
+    )
+    (models_path / "b.sql").write_text(
+        "MODEL (name db.b); SELECT * FROM db.a", encoding="utf-8"
+    )
+    context = Context(
+        paths=[tmp_path],
+        config=Config(
+            model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+            planner=PlannerConfig(mode=PlannerMode.SHADOW),
+        ),
+    )
+
+    assert context.model_graph_index is not None
+    indexed_names = [metadata.fqn for metadata in context.model_graph_index.iter_metadata()]
+    assert indexed_names == sorted(context.models)
+    model_a = next(model for model in context.models.values() if model.name == "db.a")
+    model_b = next(model for model in context.models.values() if model.name == "db.b")
+    assert context.model_graph_index.upstream({model_b.fqn}) == {model_a.fqn}
+
+
+def test_eager_planner_does_not_create_model_graph_index(tmp_path):
+    context = Context(
+        paths=[tmp_path],
+        config=Config(model_defaults=ModelDefaultsConfig(dialect="duckdb")),
+    )
+
+    assert context.model_graph_index is None
 
 
 def test_requirements(copy_to_temp_path: t.Callable):

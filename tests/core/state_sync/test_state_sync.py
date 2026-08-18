@@ -3186,6 +3186,86 @@ def test_cache(state_sync, make_snapshot, mocker):
         mock.assert_called()
 
 
+def test_cache_respects_max_entries_with_lru_eviction(state_sync, make_snapshot, mocker):
+    cache = CachingStateSync(state_sync, ttl=10, max_entries=2)
+    snapshots = [
+        make_snapshot(
+            SqlModel(
+                name=name,
+                query=parse_one(f"select '{name}', 'ds'"),
+            ),
+        )
+        for name in ("a", "b", "c")
+    ]
+    for snapshot in snapshots:
+        snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    state_sync.push_snapshots(snapshots)
+
+    now_timestamp = mocker.patch("sqlmesh.core.state_sync.cache.now_timestamp")
+    now_timestamp.return_value = to_timestamp("2023-01-01 00:00:00")
+
+    assert cache.get_snapshots([snapshots[0]])
+    assert cache.get_snapshots([snapshots[1]])
+    assert list(cache.snapshot_cache) == [snapshots[0].snapshot_id, snapshots[1].snapshot_id]
+
+    # Accessing A makes B the least-recently-used entry.
+    assert cache.get_snapshots([snapshots[0]])
+    assert cache.get_snapshots([snapshots[2]])
+    assert list(cache.snapshot_cache) == [snapshots[0].snapshot_id, snapshots[2].snapshot_id]
+
+    with patch.object(state_sync, "get_snapshots", wraps=state_sync.get_snapshots) as get_snapshots:
+        assert cache.get_snapshots([snapshots[1]])
+        get_snapshots.assert_called_once()
+    assert len(cache.snapshot_cache) == 2
+
+
+def test_cache_bounds_negative_entries(state_sync, make_snapshot, mocker):
+    cache = CachingStateSync(state_sync, ttl=10, max_entries=2)
+    missing_snapshots = [
+        make_snapshot(SqlModel(name=name, query=parse_one("select 1, 'ds'")))
+        for name in ("missing_a", "missing_b", "missing_c")
+    ]
+
+    now_timestamp = mocker.patch("sqlmesh.core.state_sync.cache.now_timestamp")
+    now_timestamp.return_value = to_timestamp("2023-01-01 00:00:00")
+
+    for snapshot in missing_snapshots:
+        assert not cache.get_snapshots([snapshot])
+
+    assert list(cache.snapshot_cache) == [
+        missing_snapshots[1].snapshot_id,
+        missing_snapshots[2].snapshot_id,
+    ]
+
+
+def test_state_reader_streams_headers_and_snapshots_in_stable_batches(state_sync, make_snapshot):
+    snapshots = [
+        make_snapshot(SqlModel(name=name, query=parse_one("select 1, 'ds'")))
+        for name in ("c", "a", "b")
+    ]
+    for snapshot in snapshots:
+        snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    state_sync.push_snapshots(snapshots)
+    reader = CachingStateSync(state_sync, max_entries=1)
+
+    header_batches = list(
+        reader.iter_snapshot_headers_by_names(
+            [snapshot.name for snapshot in snapshots], batch_size=2
+        )
+    )
+    assert [[header.name for header in batch] for batch in header_batches] == [
+        sorted(snapshot.name for snapshot in snapshots)[:2],
+        sorted(snapshot.name for snapshot in snapshots)[2:],
+    ]
+
+    snapshot_batches = list(reader.iter_snapshot_batches(snapshots, batch_size=2))
+    assert [[snapshot.name for snapshot in batch] for batch in snapshot_batches] == [
+        sorted(snapshot.name for snapshot in snapshots)[:2],
+        sorted(snapshot.name for snapshot in snapshots)[2:],
+    ]
+    assert len(reader.snapshot_cache) == 1
+
+
 def test_max_interval_end_per_model(
     state_sync: EngineAdapterStateSync, make_snapshot: t.Callable
 ) -> None:

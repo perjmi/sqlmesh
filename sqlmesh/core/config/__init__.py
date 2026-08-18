@@ -37,6 +37,10 @@ from sqlmesh.core.config.model import ModelDefaultsConfig as ModelDefaultsConfig
 from sqlmesh.core.config.naming import NameInferenceConfig as NameInferenceConfig
 from sqlmesh.core.config.linter import LinterConfig as LinterConfig
 from sqlmesh.core.config.plan import PlanConfig as PlanConfig
+from sqlmesh.core.config.planner import (
+    PlannerConfig as PlannerConfig,
+    PlannerMode as PlannerMode,
+)
 from sqlmesh.core.config.root import Config as Config, DbtConfig as DbtConfig
 from sqlmesh.core.config.run import RunConfig as RunConfig
 from sqlmesh.core.config.scheduler import BuiltInSchedulerConfig as BuiltInSchedulerConfig

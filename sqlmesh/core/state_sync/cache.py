@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import typing as t
+from collections import OrderedDict
 
 from sqlmesh.core.model import SeedModel
 from sqlmesh.core.snapshot import (
@@ -22,18 +23,41 @@ class CachingStateSync(DelegatingStateSync):
     Args:
         state_sync: The base state sync.
         ttl: The number of seconds a snapshot should be cached.
+        max_entries: The maximum number of positive and negative snapshot entries to retain.
+            ``None`` preserves the legacy unbounded behavior and ``0`` disables retention.
     """
 
-    def __init__(self, state_sync: StateSync, ttl: int = 120):
+    def __init__(
+        self, state_sync: StateSync, ttl: int = 120, max_entries: t.Optional[int] = None
+    ):
         super().__init__(state_sync)
+        if max_entries is not None and max_entries < 0:
+            raise ValueError("max_entries must be non-negative or None")
+
         # The cache can contain a snapshot or False or None.
         # False means that the snapshot does not exist in the state sync but has been requested before
         # None means that the snapshot has not been requested.
-        self.snapshot_cache: t.Dict[
+        self.snapshot_cache: OrderedDict[
             SnapshotId, t.Tuple[t.Optional[Snapshot | t.Literal[False]], int]
-        ] = {}
+        ] = OrderedDict()
 
         self.ttl = ttl
+        self.max_entries = max_entries
+
+    def _store(
+        self,
+        snapshot_id: SnapshotId,
+        snapshot: t.Optional[Snapshot | t.Literal[False]],
+        expire_at: int,
+    ) -> None:
+        if self.max_entries == 0:
+            return
+
+        self.snapshot_cache[snapshot_id] = (snapshot, expire_at)
+        self.snapshot_cache.move_to_end(snapshot_id)
+        if self.max_entries is not None:
+            while len(self.snapshot_cache) > self.max_entries:
+                self.snapshot_cache.popitem(last=False)
 
     def _from_cache(
         self, snapshot_id: SnapshotId, now: int
@@ -41,8 +65,12 @@ class CachingStateSync(DelegatingStateSync):
         snapshot: t.Optional[Snapshot | t.Literal[False]] = None
         snapshot_expiration = self.snapshot_cache.get(snapshot_id)
 
-        if snapshot_expiration and snapshot_expiration[1] >= now:
-            snapshot = snapshot_expiration[0]
+        if snapshot_expiration:
+            if snapshot_expiration[1] >= now:
+                snapshot = snapshot_expiration[0]
+                self.snapshot_cache.move_to_end(snapshot_id)
+            else:
+                self.snapshot_cache.pop(snapshot_id, None)
 
         return snapshot
 
@@ -59,7 +87,7 @@ class CachingStateSync(DelegatingStateSync):
             snapshot = self._from_cache(snapshot_id, now)
 
             if snapshot is None:
-                self.snapshot_cache[snapshot_id] = (False, expire_at)
+                self._store(snapshot_id, False, expire_at)
                 missing.add(snapshot_id)
             elif snapshot:
                 existing[snapshot_id] = snapshot
@@ -71,7 +99,7 @@ class CachingStateSync(DelegatingStateSync):
             cached = self._from_cache(snapshot_id, now)
             if cached and (not isinstance(cached.node, SeedModel) or cached.node.is_hydrated):
                 continue
-            self.snapshot_cache[snapshot_id] = (snapshot, expire_at)
+            self._store(snapshot_id, snapshot, expire_at)
 
         return existing
 
@@ -127,11 +155,11 @@ class CachingStateSync(DelegatingStateSync):
                 self.snapshot_cache.pop(snapshot_intervals.snapshot_id, None)
             else:
                 # Evict all snapshots that share the same name
-                self.snapshot_cache = {
-                    snapshot_id: value
+                self.snapshot_cache = OrderedDict(
+                    (snapshot_id, value)
                     for snapshot_id, value in self.snapshot_cache.items()
                     if snapshot_id.name != snapshot_intervals.name
-                }
+                )
         self.state_sync.add_snapshots_intervals(snapshots_intervals)
 
     def remove_intervals(

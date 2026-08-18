@@ -16,6 +16,7 @@ from sqlmesh.core import constants as c
 from sqlmesh.core.dialect import normalize_model_name
 from sqlmesh.core.environment import Environment
 from sqlmesh.core.model import update_model_schemas
+from sqlmesh.core.model.registry import ModelMetadata, ModelRegistry
 from sqlmesh.core.audit import StandaloneAudit
 from sqlmesh.utils import UniqueKeyDict
 from sqlmesh.utils.dag import DAG
@@ -511,3 +512,114 @@ def parse(selector: str, dialect: DialectType = None) -> exp.Expr:
         return this
 
     return _parse_conjunction()
+
+
+class MetadataSelector:
+    """Expands native selections using compact registry metadata instead of model payloads."""
+
+    def __init__(
+        self,
+        registry: ModelRegistry,
+        context_path: Path = Path("."),
+        default_catalog: t.Optional[str] = None,
+        dialect: t.Optional[str] = None,
+    ) -> None:
+        self._registry = registry
+        self._default_catalog = default_catalog
+        self._dialect = dialect
+        self._git_client = GitClient(context_path)
+
+    def expand_model_selections(self, model_selections: t.Iterable[str]) -> t.Set[str]:
+        node = parse(" | ".join(f"({selection})" for selection in model_selections))
+        records = tuple(self._registry.iter_metadata())
+        records_by_name = {record.fqn: record for record in records}
+        all_names = set(records_by_name)
+        models_by_tags: t.Dict[str, t.Set[str]] = {}
+        for record in records:
+            for tag in record.tags:
+                models_by_tags.setdefault(tag.lower(), set()).add(record.fqn)
+
+        def evaluate(expression: exp.Expr) -> t.Set[str]:
+            if isinstance(expression, exp.Var):
+                pattern = expression.name
+                if "*" in pattern:
+                    return {
+                        record.fqn
+                        for record in records
+                        if fnmatch.fnmatchcase(record.name, pattern)
+                    }
+                fqn = normalize_model_name(
+                    pattern,
+                    default_catalog=self._default_catalog,
+                    dialect=self._dialect,
+                )
+                return {fqn} if fqn in records_by_name else set()
+            if isinstance(expression, exp.And):
+                return evaluate(expression.left) & evaluate(expression.right)
+            if isinstance(expression, exp.Or):
+                return evaluate(expression.left) | evaluate(expression.right)
+            if isinstance(expression, exp.Paren):
+                return evaluate(expression.this)
+            if isinstance(expression, exp.Not):
+                return all_names - evaluate(expression.this)
+            if isinstance(expression, Git):
+                git_modified_files = {
+                    *self._git_client.list_untracked_files(),
+                    *self._git_client.list_uncommitted_changed_files(),
+                    *self._git_client.list_committed_changed_files(target_branch=expression.name),
+                }
+                return {
+                    record.fqn
+                    for record in records
+                    if record.source_path is not None and record.source_path in git_modified_files
+                }
+            if isinstance(expression, Tag):
+                pattern = expression.name.lower()
+                if "*" in pattern:
+                    return {
+                        model
+                        for tag, models in models_by_tags.items()
+                        for model in models
+                        if fnmatch.fnmatchcase(tag, pattern)
+                    }
+                return models_by_tags.get(pattern, set())
+            if isinstance(expression, ResourceType):
+                resource_type = expression.name.lower()
+                if resource_type not in ("model", "seed", "source"):
+                    raise SQLMeshError(f"Unsupported resource type: {resource_type}")
+                return {
+                    record.fqn
+                    for record in records
+                    if self._matches_resource_type(resource_type, record)
+                }
+            if isinstance(expression, Direction):
+                selected = evaluate(expression.this)
+                result = set(selected)
+                if expression.args.get("up"):
+                    result.update(self._registry.upstream(selected) & all_names)
+                if expression.args.get("down"):
+                    result.update(self._registry.downstream(selected) & all_names)
+                return result
+            raise ParseError(f"Unexpected node {expression}")
+
+        return evaluate(node)
+
+    def selection_boundary(
+        self, model_selections: t.Iterable[str]
+    ) -> t.Tuple[t.Set[str], t.Set[str], t.Set[str]]:
+        """Returns selected models and their disjoint upstream/downstream boundaries."""
+        selected = self.expand_model_selections(model_selections)
+        known_names = {metadata.fqn for metadata in self._registry.iter_metadata()}
+        upstream = (self._registry.upstream(selected) & known_names) - selected
+        downstream = (
+            self._registry.downstream(selected) & known_names
+        ) - selected - upstream
+        return selected, upstream, downstream
+
+    @staticmethod
+    def _matches_resource_type(resource_type: str, record: ModelMetadata) -> bool:
+        if resource_type == "seed":
+            return record.kind_name == "SEED"
+        if resource_type == "source":
+            return record.kind_name == "EXTERNAL"
+        return record.kind_name not in ("SEED", "EXTERNAL")

@@ -14,6 +14,7 @@ from sqlmesh.core.config import (
     DuckDBConnectionConfig,
     GatewayConfig,
     ModelDefaultsConfig,
+    PlannerConfig,
     BigQueryConnectionConfig,
     MotherDuckConnectionConfig,
     BuiltInSchedulerConfig,
@@ -124,6 +125,24 @@ def test_update_with_model_defaults():
     assert config_a.update_with(config_b) == Config(
         model_defaults=ModelDefaultsConfig(start="2022-01-01", dialect="spark")
     )
+
+
+def test_update_with_planner_config():
+    config_a = Config(planner=PlannerConfig(model_batch_size=25))
+    config_b = Config(planner=PlannerConfig(hydrated_snapshot_cache_size=50))
+
+    assert config_a.update_with(config_b).planner == PlannerConfig(
+        model_batch_size=25,
+        hydrated_snapshot_cache_size=50,
+    )
+
+
+def test_planner_config_rejects_invalid_bounds():
+    with pytest.raises(ValueError, match="greater than 0"):
+        PlannerConfig(model_batch_size=0)
+
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        PlannerConfig(hydrated_snapshot_cache_size=-1)
 
 
 def test_default_gateway():

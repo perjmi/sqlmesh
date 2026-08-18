@@ -108,6 +108,48 @@ class StateReader(abc.ABC):
             A set containing all the matched snapshot records. To fetch full snapshots, pass it into StateSync.get_snapshots()
         """
 
+    def iter_snapshot_batches(
+        self,
+        snapshot_ids: t.Iterable[SnapshotIdLike],
+        batch_size: int,
+    ) -> t.Iterator[t.Tuple[Snapshot, ...]]:
+        """Hydrates snapshots in deterministic, bounded request batches."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than 0")
+
+        ordered_ids = sorted(
+            {snapshot.snapshot_id for snapshot in snapshot_ids},
+            key=lambda snapshot_id: (snapshot_id.name, snapshot_id.identifier),
+        )
+        for offset in range(0, len(ordered_ids), batch_size):
+            batch_ids = ordered_ids[offset : offset + batch_size]
+            snapshots = self.get_snapshots(batch_ids)
+            yield tuple(
+                snapshots[snapshot_id]
+                for snapshot_id in batch_ids
+                if snapshot_id in snapshots
+            )
+
+    def iter_snapshot_headers_by_names(
+        self,
+        snapshot_names: t.Iterable[str],
+        batch_size: int,
+        current_ts: t.Optional[int] = None,
+        exclude_expired: bool = True,
+    ) -> t.Iterator[t.Tuple[SnapshotIdAndVersion, ...]]:
+        """Fetches compact snapshot records in deterministic name batches."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than 0")
+
+        ordered_names = sorted(set(snapshot_names))
+        for offset in range(0, len(ordered_names), batch_size):
+            headers = self.get_snapshots_by_names(
+                ordered_names[offset : offset + batch_size],
+                current_ts=current_ts,
+                exclude_expired=exclude_expired,
+            )
+            yield tuple(sorted(headers, key=lambda header: (header.name, header.identifier)))
+
     @abc.abstractmethod
     def snapshots_exist(self, snapshot_ids: t.Iterable[SnapshotIdLike]) -> t.Set[SnapshotId]:
         """Checks if multiple snapshots exist in the state sync.
