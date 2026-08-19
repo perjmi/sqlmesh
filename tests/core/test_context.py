@@ -1,7 +1,9 @@
+import gc
 import logging
 import pathlib
 import typing as t
 import re
+import weakref
 from datetime import date, timedelta, datetime
 from tempfile import TemporaryDirectory
 from unittest.mock import PropertyMock, call, patch
@@ -2733,6 +2735,51 @@ def test_streaming_full_load_diff_marks_new_snapshots_without_hydrating_payloads
 
     assert len(context_diff.added) == 2
     assert len(context_diff.new_snapshots) == 2
+
+
+def test_streaming_plan_builder_does_not_retain_all_hydrated_snapshots(
+    tmp_path, monkeypatch
+):
+    from sqlmesh.core.plan.store import SnapshotPlanStore
+
+    models_path = tmp_path / "models"
+    models_path.mkdir()
+    for index in range(20):
+        (models_path / f"model_{index}.sql").write_text(
+            f"MODEL (name db.model_{index}); SELECT {index} AS id"
+        )
+
+    context = Context(
+        paths=[tmp_path],
+        config=Config(
+            model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+            planner=PlannerConfig(
+                mode=PlannerMode.STREAMING,
+                hydrated_snapshot_cache_size=1,
+            ),
+        ),
+    )
+    hydrated_snapshots = {}
+    original_get_snapshot = SnapshotPlanStore.get_snapshot
+
+    def track_hydrated_snapshot(self, snapshot_id, *, new_only=False):
+        snapshot = original_get_snapshot(self, snapshot_id, new_only=new_only)
+        hydrated_snapshots[id(snapshot)] = weakref.ref(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(SnapshotPlanStore, "get_snapshot", track_hydrated_snapshot)
+
+    builder = context.plan_builder("dev", skip_tests=True, skip_backfill=True)
+    plan = builder.build()
+    gc.collect()
+
+    live_snapshots = [
+        snapshot
+        for reference in hydrated_snapshots.values()
+        if (snapshot := reference()) is not None
+    ]
+    assert len(plan.new_snapshots) == 20
+    assert len(live_snapshots) <= 2
 
 
 def test_requirements(copy_to_temp_path: t.Callable):

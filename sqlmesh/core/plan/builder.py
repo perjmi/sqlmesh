@@ -1161,7 +1161,7 @@ class PlanBuilder:
                 self._enable_preview
                 and any(
                     snapshot.model.forward_only
-                    for snapshot in self._modified_and_added_snapshots
+                    for snapshot in self._iter_modified_and_added_snapshots()
                     if snapshot.is_model
                 )
             )
@@ -1171,7 +1171,7 @@ class PlanBuilder:
     def _non_forward_only_preview_needed(self) -> bool:
         if not self._is_dev:
             return False
-        for snapshot in self._modified_and_added_snapshots:
+        for snapshot in self._iter_modified_and_added_snapshots():
             if not snapshot.is_model:
                 continue
             if (
@@ -1181,11 +1181,11 @@ class PlanBuilder:
                 return True
         return False
 
-    @cached_property
-    def _modified_and_added_snapshots(self) -> t.List[Snapshot]:
-        return [
-            snapshot
-            for snapshot in self._context_diff.snapshots.values()
-            if snapshot.name in self._context_diff.modified_snapshots
-            or snapshot.snapshot_id in self._context_diff.added
-        ]
+    def _iter_modified_and_added_snapshots(self) -> t.Iterator[Snapshot]:
+        """Yields changed snapshots without retaining hydrated payloads between passes."""
+        for snapshot in self._context_diff.snapshots.values():
+            if (
+                snapshot.name in self._context_diff.modified_snapshots
+                or snapshot.snapshot_id in self._context_diff.added
+            ):
+                yield snapshot

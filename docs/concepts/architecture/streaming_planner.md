@@ -29,6 +29,8 @@ The branch currently implements the shadow-safe foundation and keeps eager appli
   persisted snapshot edges, and disk-backed topological traversal.
 - Worker-built snapshot payloads and streaming context-diff merging that write serialized snapshots
   directly to the plan catalog instead of constructing all-snapshot dictionaries in the coordinator.
+- Streaming preview eligibility checks that repeatedly scan the SQLite-backed snapshot mapping without
+  caching hydrated changed snapshots in `PlanBuilder`.
 - SQLite-backed snapshot DAG traversal, deployability propagation, and earliest-start inference.
 - Shadow checks for graph round-trips, selection, fingerprints, and context-diff change sets.
 - A two-Postgres random-graph oracle that runs eager reference plans against shadow candidates.
@@ -110,9 +112,11 @@ snapshots. `CachingStateSync` retains requested snapshots in an unbounded proces
 ### Plan
 
 The streaming `ContextDiff` and `Plan` snapshot collections are backed by a per-plan SQLite catalog and
-an entry-bounded hydration cache. The current change-ID sets and modified old/new pairs are still Python
-collections, while `PlanStagesBuilder`, evaluatable-plan conversion, environment construction, and
-several application stages can still materialize complete snapshot collections.
+an entry-bounded hydration cache. Preview eligibility and categorization traverse those mappings without
+retaining a project-wide hydrated snapshot list. The current change-ID sets and modified old/new pairs
+are still Python collections, while `PlanStagesBuilder`, evaluatable-plan conversion, environment
+construction, and several application stages can still materialize complete compact snapshot metadata
+collections.
 
 ## Target architecture
 
