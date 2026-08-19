@@ -106,9 +106,10 @@ CANDIDATE_PLANNER_MODE=streaming \
 pytest -q -o addopts='' -p no:cacheprovider tests/test_dual_planner_mutations.py
 ```
 
-Use `RANDOMGRAPHS_MUTATION_TIER=pr`, `nightly`, or `stress` for broader graph and mutation seeds.
-The exact row comparison is deliberately simple and becomes expensive at the larger tiers; it is
-an independent correctness oracle rather than a performance benchmark.
+Use `RANDOMGRAPHS_MUTATION_TIER=sweep10` for ten independent smoke-sized seeds, or `pr`,
+`nightly`, or `stress` for broader graphs. The exact row comparison is deliberately simple and
+becomes expensive at the larger tiers; it is an independent correctness oracle rather than a
+performance benchmark.
 
 For multi-process memory comparisons, use `cgroup_peak_mib` from `benchmark_branch_plans.py` as the
 primary whole-container measurement. Aggregate RSS remains in the output for continuity but counts

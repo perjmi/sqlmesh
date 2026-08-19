@@ -54,6 +54,10 @@ ACCURACY_TIERS: dict[str, tuple[AccuracyScenario, ...]] = {
 
 MUTATION_TIERS: dict[str, tuple[MutationScenario, ...]] = {
     "smoke": (MutationScenario(width=3, graph_seed=7, mutation_seed=11),),
+    "sweep10": tuple(
+        MutationScenario(width=3, graph_seed=100 + index, mutation_seed=1001 + index)
+        for index in range(10)
+    ),
     "pr": (
         MutationScenario(width=3, graph_seed=0, mutation_seed=11),
         MutationScenario(width=10, graph_seed=1, mutation_seed=29),

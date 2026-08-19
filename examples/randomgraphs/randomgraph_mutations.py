@@ -166,7 +166,7 @@ def generate_model_mutations(graph: GeneratedGraph, *, seed: int) -> tuple[Model
         )
     )
 
-    audit_model = rng.choice(graph.input_models)
+    audit_model = rng.choice([name for name in graph.input_models if name != kind_model])
     mutations.append(
         ModelMutation(
             kind="audit",
