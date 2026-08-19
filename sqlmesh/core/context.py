@@ -2636,11 +2636,20 @@ class GenericContext(BaseContext, t.Generic[C]):
             False if any of the audits failed, True otherwise.
         """
 
-        snapshots = (
-            [self.get_snapshot(model, raise_if_missing=True) for model in models]
-            if models
-            else self.snapshots.values()
-        )
+        all_snapshots = self.snapshots
+        if isinstance(all_snapshots, IndexedSnapshotNameMapping):
+            self._merge_stored_streaming_snapshots(all_snapshots)
+
+        if models:
+            snapshots = []
+            for model in models:
+                fqn = self._node_or_snapshot_to_fqn(model)
+                snapshot = all_snapshots.get(fqn)
+                if snapshot is None:
+                    raise SQLMeshError(f"Cannot find snapshot for '{fqn}'")
+                snapshots.append(snapshot)
+        else:
+            snapshots = all_snapshots.values()
 
         num_audits = sum(len(snapshot.node.audits_with_args) for snapshot in snapshots)
         self.console.log_status_update(f"Found {num_audits} audit(s).")
@@ -2653,7 +2662,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                 start=start,
                 end=end,
                 execution_time=execution_time,
-                snapshots=self.snapshots,
+                snapshots=t.cast(t.Dict[str, Snapshot], all_snapshots),
             ):
                 audit_id = f"{audit_result.audit.name}"
                 if audit_result.model:
@@ -3362,6 +3371,36 @@ class GenericContext(BaseContext, t.Generic[C]):
             snapshot.node = snapshots[snapshot.name].node
 
         return {name: stored_snapshots.get(s.snapshot_id, s) for name, s in snapshots.items()}
+
+    def _merge_stored_streaming_snapshots(
+        self, snapshots: IndexedSnapshotNameMapping
+    ) -> None:
+        """Merge versioned state snapshots into a bounded streaming snapshot store."""
+        store = snapshots.store
+        snapshot_ids_batch: t.List[SnapshotId] = []
+
+        def merge_batch(snapshot_ids: t.Sequence[SnapshotId]) -> None:
+            stored = self.state_reader.get_snapshots(snapshot_ids)
+            merged: t.List[t.Tuple[Snapshot, bool]] = []
+            for snapshot_id in snapshot_ids:
+                existing = stored.get(snapshot_id)
+                if existing is None:
+                    continue
+                local = store.get_snapshot(snapshot_id)
+                # Preserve the current project node so audit definitions and renderer caches are
+                # current while version and interval metadata come from persisted state.
+                existing.node = local.node
+                merged.append((existing.copy(), False))
+            if merged:
+                store.put_snapshots(merged)
+
+        for snapshot_id in store.iter_snapshot_ids():
+            snapshot_ids_batch.append(snapshot_id)
+            if len(snapshot_ids_batch) == store.write_batch_size:
+                merge_batch(snapshot_ids_batch)
+                snapshot_ids_batch = []
+        if snapshot_ids_batch:
+            merge_batch(snapshot_ids_batch)
 
     def _context_diff(
         self,

@@ -73,9 +73,10 @@ docker compose build sqlmesh
 pytest -q -o addopts='' -p no:cacheprovider tests/test_dual_planner_accuracy.py
 ```
 
-The reference service explicitly uses `planner.mode: eager`; the candidate uses
-`planner.mode: shadow`. Shadow mode still applies the eager plan, but fails the run if indexed
-metadata selection, streamed fingerprints, or the compact context diff disagree with it.
+The reference service leaves the planner setting unset, so an image from the SQLMesh main branch
+uses its traditional planner. The candidate uses `planner.mode: shadow` by default. Shadow mode
+still applies the traditional plan, but fails the run if indexed metadata selection, streamed
+fingerprints, or the compact context diff disagree with it.
 
 Select a larger tier with `RANDOMGRAPHS_ACCURACY_TIER=pr`, `nightly`, or `stress`. To compare two
 implementations, set `REFERENCE_SQLMESH_IMAGE` and `CANDIDATE_SQLMESH_IMAGE` to their respective
@@ -90,6 +91,24 @@ Native streaming plans use two bounded workers by default in this suite. Overrid
 `STREAMING_WORKERS` to control parallelism and `STREAMING_WORKER_MAX_TASKS` to control how often
 worker processes are recycled. The coordinator remains the sole SQLite writer; workers persist
 model payloads independently and return compact metadata or serialized snapshots.
+
+The mutation regression suite goes further by giving both databases the same randomized owner,
+schema, and audit baseline, then applying the same deterministic sequence of input-data, filter,
+dependency, and model-kind changes. After every deployed change it compares aggregate signatures
+and then naively fetches and compares every ordered row from every generated materialized view. It
+also injects the same invalid row into each PostgreSQL database so an attached blocking audit must
+pass, fail with the same violation count, and pass again after repair on both implementations:
+
+```bash
+REFERENCE_SQLMESH_IMAGE=randomgraphs-sqlmesh-main:latest \
+CANDIDATE_SQLMESH_IMAGE=randomgraphs-sqlmesh-streaming-iterator:latest \
+CANDIDATE_PLANNER_MODE=streaming \
+pytest -q -o addopts='' -p no:cacheprovider tests/test_dual_planner_mutations.py
+```
+
+Use `RANDOMGRAPHS_MUTATION_TIER=pr`, `nightly`, or `stress` for broader graph and mutation seeds.
+The exact row comparison is deliberately simple and becomes expensive at the larger tiers; it is
+an independent correctness oracle rather than a performance benchmark.
 
 For multi-process memory comparisons, use `cgroup_peak_mib` from `benchmark_branch_plans.py` as the
 primary whole-container measurement. Aggregate RSS remains in the output for continuity but counts

@@ -17,6 +17,19 @@ class AccuracyScenario:
         return f"width_{self.width}-seed_{self.seed}-{self.candidate_mode}"
 
 
+@dataclass(frozen=True)
+class MutationScenario:
+    width: int
+    graph_seed: int
+    mutation_seed: int
+
+    @property
+    def test_id(self) -> str:
+        return (
+            f"width_{self.width}-graph_{self.graph_seed}-mutations_{self.mutation_seed}"
+        )
+
+
 ACCURACY_TIERS: dict[str, tuple[AccuracyScenario, ...]] = {
     "smoke": (
         AccuracyScenario(width=3, seed=7, candidate_mode="full"),
@@ -39,6 +52,22 @@ ACCURACY_TIERS: dict[str, tuple[AccuracyScenario, ...]] = {
     ),
 }
 
+MUTATION_TIERS: dict[str, tuple[MutationScenario, ...]] = {
+    "smoke": (MutationScenario(width=3, graph_seed=7, mutation_seed=11),),
+    "pr": (
+        MutationScenario(width=3, graph_seed=0, mutation_seed=11),
+        MutationScenario(width=10, graph_seed=1, mutation_seed=29),
+    ),
+    "nightly": (
+        MutationScenario(width=10, graph_seed=0, mutation_seed=11),
+        MutationScenario(width=30, graph_seed=1, mutation_seed=29),
+    ),
+    "stress": (
+        MutationScenario(width=100, graph_seed=42, mutation_seed=11),
+        MutationScenario(width=200, graph_seed=43, mutation_seed=29),
+    ),
+}
+
 
 def selected_accuracy_scenarios() -> tuple[AccuracyScenario, ...]:
     tier = os.environ.get("RANDOMGRAPHS_ACCURACY_TIER", "smoke")
@@ -47,3 +76,12 @@ def selected_accuracy_scenarios() -> tuple[AccuracyScenario, ...]:
     except KeyError as ex:
         choices = ", ".join(sorted(ACCURACY_TIERS))
         raise ValueError(f"Unknown accuracy tier {tier!r}; choose one of: {choices}") from ex
+
+
+def selected_mutation_scenarios() -> tuple[MutationScenario, ...]:
+    tier = os.environ.get("RANDOMGRAPHS_MUTATION_TIER", "smoke")
+    try:
+        return MUTATION_TIERS[tier]
+    except KeyError as ex:
+        choices = ", ".join(sorted(MUTATION_TIERS))
+        raise ValueError(f"Unknown mutation tier {tier!r}; choose one of: {choices}") from ex

@@ -2737,6 +2737,39 @@ def test_streaming_full_load_diff_marks_new_snapshots_without_hydrating_payloads
     assert len(context_diff.new_snapshots) == 2
 
 
+def test_streaming_audit_merges_versioned_snapshots_from_state(tmp_path):
+    models_path = tmp_path / "models"
+    models_path.mkdir()
+    (models_path / "a.sql").write_text(
+        """
+        MODEL (
+          name db.a,
+          kind FULL,
+          audits (not_null(columns=[id]))
+        );
+
+        SELECT 1 AS id
+        """
+    )
+    context = Context(
+        paths=[tmp_path],
+        config=Config(
+            default_connection=DuckDBConnectionConfig(),
+            model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+            planner=PlannerConfig(
+                mode=PlannerMode.STREAMING,
+                hydrated_snapshot_cache_size=1,
+                snapshot_batch_size=1,
+            ),
+        ),
+    )
+    context.plan(no_prompts=True, auto_apply=True)
+
+    assert context.audit(models=["db.a"], start="2020-01-01", end="2020-01-01")
+    assert context._active_plan_store is not None
+    assert context._active_plan_store.max_cache_size_seen <= 1
+
+
 def test_streaming_plan_builder_does_not_retain_all_hydrated_snapshots(
     tmp_path, monkeypatch
 ):

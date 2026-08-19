@@ -14,6 +14,7 @@ from generate_model_graph import (  # noqa: E402
     chunk_model_graph,
     generate_model_graph,
 )
+from randomgraph_mutations import generate_model_mutations  # noqa: E402
 
 
 def test_generate_model_graph(tmp_path: Path) -> None:
@@ -60,6 +61,25 @@ def test_generation_is_deterministic_and_removes_stale_models(tmp_path: Path) ->
     assert len(smaller.model_paths) == GRAPH_DEPTH + 1
     assert not (tmp_path / "input_0001.sql").exists()
     assert not (tmp_path / "mv_d06_0002.sql").exists()
+
+
+def test_random_model_mutations_cover_semantic_change_kinds(tmp_path: Path) -> None:
+    graph = generate_model_graph(3, output_dir=tmp_path, seed=7)
+    mutations = generate_model_mutations(graph, seed=11)
+
+    assert {mutation.kind for mutation in mutations} == {
+        "metadata",
+        "data",
+        "filter",
+        "dependency",
+        "schema",
+        "model_kind",
+        "audit",
+    }
+
+    for mutation in mutations:
+        mutation.apply()
+        assert parse(mutation.path.read_text())
 
 
 def test_row_count_bounds_are_configurable(tmp_path: Path) -> None:

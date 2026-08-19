@@ -40,7 +40,6 @@ services:
       POSTGRES_PASSWORD: postgres
       SQLMESH_CACHE_DIR: /tmp/sqlmesh-cache
       PYTHONDONTWRITEBYTECODE: 1
-      SQLMESH__PLANNER__MODE: eager
     depends_on:
       reference_db:
         condition: service_healthy
