@@ -1,0 +1,3 @@
+branch,width,samples,time_mean_seconds,time_median_seconds,time_stdev_seconds,time_p95_seconds,rss_mean_mib,rss_median_mib,rss_stdev_mib,rss_p95_mib,cgroup_peak_mean_mib,cgroup_peak_median_mib,cgroup_peak_stdev_mib,cgroup_peak_p95_mib
+main,2000,5,576.453369,575.436430,5.303824,583.485222,5109.303906,5109.503906,2.475139,5112.278125,5142.402344,5142.488281,2.151168,5145.167187
+streaming,2000,5,1214.490836,1215.018665,3.592178,1218.901905,2857.938281,2812.242188,106.949628,2992.615625,2924.873437,2889.902344,105.156429,3056.525000
