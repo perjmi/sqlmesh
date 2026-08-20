@@ -1,0 +1,3 @@
+branch,width,samples,time_mean_seconds,time_median_seconds,time_stdev_seconds,time_p95_seconds,rss_mean_mib,rss_median_mib,rss_stdev_mib,rss_p95_mib
+main,1000,5,234.858243,230.852854,9.295927,247.247052,2877.741406,2875.675781,5.300983,2884.580469
+streaming,1000,5,613.422843,594.568061,27.955942,645.669336,1586.700781,1583.523438,22.268958,1615.163281
