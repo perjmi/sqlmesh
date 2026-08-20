@@ -34,6 +34,21 @@ class SerializedSnapshot:
         )
 
 
+@dataclass(frozen=True)
+class SerializedSnapshotUpdate:
+    """A worker-produced snapshot payload update that preserves graph metadata."""
+
+    snapshot_id: SnapshotId
+    payload: bytes
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Snapshot) -> SerializedSnapshotUpdate:
+        return cls(
+            snapshot_id=snapshot.snapshot_id,
+            payload=pickle.dumps(snapshot, protocol=pickle.HIGHEST_PROTOCOL),
+        )
+
+
 class IndexedSnapshotMapping(Mapping[SnapshotId, Snapshot]):
     """A mapping view over snapshots whose payloads live in a plan store."""
 
@@ -377,13 +392,16 @@ class SnapshotPlanStore:
         return snapshot
 
     def get_snapshot_by_name(self, name: str) -> Snapshot:
+        return self.get_snapshot(self.get_snapshot_id_by_name(name))
+
+    def get_snapshot_id_by_name(self, name: str) -> SnapshotId:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT identifier FROM snapshots WHERE name = ?", (name,)
             ).fetchone()
         if row is None:
             raise KeyError(name)
-        return self.get_snapshot(SnapshotId(name=name, identifier=row["identifier"]))
+        return SnapshotId(name=name, identifier=row["identifier"])
 
     def contains_snapshot_name(self, name: str) -> bool:
         with self._connect() as connection:
@@ -453,22 +471,43 @@ class SnapshotPlanStore:
 
     def save_snapshots(self, snapshots: t.Iterable[Snapshot]) -> None:
         """Immediately persists a bounded batch without changing graph metadata."""
+        self.save_serialized_snapshot_updates(
+            SerializedSnapshotUpdate.from_snapshot(snapshot) for snapshot in snapshots
+        )
+
+    def save_serialized_snapshot_updates(
+        self,
+        snapshots: t.Iterable[SerializedSnapshotUpdate],
+        *,
+        connection: t.Optional[sqlite3.Connection] = None,
+    ) -> None:
+        """Persists bounded worker-produced payload updates through the coordinator writer."""
         records = tuple(snapshots)
-        with self._connect() as connection:
-            connection.executemany(
-                "UPDATE snapshots SET payload = ? WHERE name = ? AND identifier = ?",
-                (
-                    (
-                        sqlite3.Binary(pickle.dumps(snapshot, protocol=pickle.HIGHEST_PROTOCOL)),
-                        snapshot.snapshot_id.name,
-                        snapshot.snapshot_id.identifier,
-                    )
-                    for snapshot in records
-                ),
-            )
+        if connection is not None:
+            self._save_serialized_snapshot_updates(connection, records)
+        else:
+            with self._connect() as owned_connection:
+                self._save_serialized_snapshot_updates(owned_connection, records)
+
         for snapshot in records:
             self._cache.pop(snapshot.snapshot_id, None)
             self._pending_payloads.pop(snapshot.snapshot_id, None)
+
+    @staticmethod
+    def _save_serialized_snapshot_updates(
+        connection: sqlite3.Connection, snapshots: t.Iterable[SerializedSnapshotUpdate]
+    ) -> None:
+        connection.executemany(
+            "UPDATE snapshots SET payload = ? WHERE name = ? AND identifier = ?",
+            (
+                (
+                    sqlite3.Binary(snapshot.payload),
+                    snapshot.snapshot_id.name,
+                    snapshot.snapshot_id.identifier,
+                )
+                for snapshot in snapshots
+            ),
+        )
 
     def clear_cache(self) -> None:
         self.flush()
@@ -545,38 +584,60 @@ class SnapshotPlanStore:
                 "topological_work(processed, remaining_dependencies, name, identifier)"
             )
             connection.execute(
-                "CREATE TEMP TABLE topological_batch "
+                "CREATE TEMP TABLE topological_wave "
                 "(name TEXT NOT NULL, identifier TEXT NOT NULL, PRIMARY KEY(name, identifier))"
             )
 
             while True:
-                rows = connection.execute(
+                connection.execute("DELETE FROM topological_wave")
+                connection.execute(
                     """
+                    INSERT INTO topological_wave(name, identifier)
                     SELECT name, identifier FROM topological_work
                     WHERE processed = 0 AND remaining_dependencies = 0
-                    ORDER BY name, identifier LIMIT ?
-                    """,
-                    (batch_size,),
-                ).fetchall()
-                if not rows:
+                    """
+                )
+                wave_size = connection.execute(
+                    "SELECT COUNT(*) AS count FROM topological_wave"
+                ).fetchone()["count"]
+                if not wave_size:
                     break
 
-                batch = tuple(
-                    SnapshotId(name=row["name"], identifier=row["identifier"]) for row in rows
-                )
-                yield batch
-                connection.execute("DELETE FROM topological_batch")
-                connection.executemany(
-                    "INSERT INTO topological_batch(name, identifier) VALUES (?, ?)",
-                    ((snapshot_id.name, snapshot_id.identifier) for snapshot_id in batch),
-                )
+                last_name: t.Optional[str] = None
+                last_identifier: t.Optional[str] = None
+                while True:
+                    if last_name is None:
+                        rows = connection.execute(
+                            """
+                            SELECT name, identifier FROM topological_wave
+                            ORDER BY name, identifier LIMIT ?
+                            """,
+                            (batch_size,),
+                        ).fetchall()
+                    else:
+                        rows = connection.execute(
+                            """
+                            SELECT name, identifier FROM topological_wave
+                            WHERE name > ? OR (name = ? AND identifier > ?)
+                            ORDER BY name, identifier LIMIT ?
+                            """,
+                            (last_name, last_name, last_identifier, batch_size),
+                        ).fetchall()
+                    if not rows:
+                        break
+                    last_name = rows[-1]["name"]
+                    last_identifier = rows[-1]["identifier"]
+                    yield tuple(
+                        SnapshotId(name=row["name"], identifier=row["identifier"]) for row in rows
+                    )
+
                 connection.execute(
                     """
                     UPDATE topological_work SET processed = 1
                     WHERE EXISTS (
-                        SELECT 1 FROM topological_batch AS batch
-                        WHERE batch.name = topological_work.name
-                        AND batch.identifier = topological_work.identifier
+                        SELECT 1 FROM topological_wave AS wave
+                        WHERE wave.name = topological_work.name
+                        AND wave.identifier = topological_work.identifier
                     )
                     """
                 )
@@ -585,17 +646,17 @@ class SnapshotPlanStore:
                     UPDATE topological_work
                     SET remaining_dependencies = remaining_dependencies - (
                         SELECT COUNT(*) FROM snapshot_edges AS edge
-                        JOIN topological_batch AS batch
-                            ON batch.name = edge.parent_name
-                            AND batch.identifier = edge.parent_identifier
+                        JOIN topological_wave AS wave
+                            ON wave.name = edge.parent_name
+                            AND wave.identifier = edge.parent_identifier
                         WHERE edge.child_name = topological_work.name
                         AND edge.child_identifier = topological_work.identifier
                     )
                     WHERE processed = 0 AND EXISTS (
                         SELECT 1 FROM snapshot_edges AS edge
-                        JOIN topological_batch AS batch
-                            ON batch.name = edge.parent_name
-                            AND batch.identifier = edge.parent_identifier
+                        JOIN topological_wave AS wave
+                            ON wave.name = edge.parent_name
+                            AND wave.identifier = edge.parent_identifier
                         WHERE edge.child_name = topological_work.name
                         AND edge.child_identifier = topological_work.identifier
                     )
@@ -617,6 +678,40 @@ class SnapshotPlanStore:
 
     def downstream(self, snapshot_id: SnapshotId) -> t.Set[SnapshotId]:
         return self._traverse(snapshot_id, upstream=False)
+
+    def snapshots_with_upstream(self, names: t.Iterable[str]) -> t.Set[SnapshotId]:
+        """Returns named snapshots and their ancestors using one SQLite traversal."""
+        selected_names = tuple(set(names))
+        if not selected_names:
+            return set()
+
+        with self._connect() as connection:
+            connection.execute(
+                "CREATE TEMP TABLE selected_snapshot_names "
+                "(name TEXT NOT NULL PRIMARY KEY) WITHOUT ROWID"
+            )
+            connection.executemany(
+                "INSERT INTO selected_snapshot_names(name) VALUES (?)",
+                ((name,) for name in selected_names),
+            )
+            rows = connection.execute(
+                """
+                WITH RECURSIVE selected(name, identifier) AS (
+                    SELECT snapshot.name, snapshot.identifier
+                    FROM snapshots AS snapshot
+                    JOIN selected_snapshot_names AS requested
+                      ON requested.name = snapshot.name
+                    UNION
+                    SELECT edge.parent_name, edge.parent_identifier
+                    FROM snapshot_edges AS edge
+                    JOIN selected
+                      ON selected.name = edge.child_name
+                     AND selected.identifier = edge.child_identifier
+                )
+                SELECT name, identifier FROM selected
+                """
+            )
+            return {SnapshotId(name=row["name"], identifier=row["identifier"]) for row in rows}
 
     def parents(self, snapshot_id: SnapshotId) -> t.Tuple[SnapshotId, ...]:
         with self._connect() as connection:

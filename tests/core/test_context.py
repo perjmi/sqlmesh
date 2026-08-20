@@ -2707,6 +2707,58 @@ def test_streaming_plan_builds_snapshots_without_coordinator_model_hydration(
     assert context.indexed_model_registry.max_cache_size_seen == 0
 
 
+def test_streaming_finalizes_added_snapshots_without_coordinator_hydration(
+    tmp_path, monkeypatch
+):
+    from sqlmesh.core.plan.store import SnapshotPlanStore
+
+    models_path = tmp_path / "models"
+    models_path.mkdir()
+    for index in range(8):
+        (models_path / f"model_{index}.sql").write_text(
+            f"MODEL (name db.model_{index}); SELECT {index} AS id"
+        )
+    context = Context(
+        paths=[tmp_path],
+        config=Config(
+            model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+            planner=PlannerConfig(
+                mode=PlannerMode.STREAMING,
+                streaming_workers=2,
+                streaming_worker_max_tasks=2,
+            ),
+        ),
+    )
+    builder = context.plan_builder("dev", skip_tests=True, skip_backfill=True)
+    store = builder._context_diff.snapshots.store
+    original_get_snapshot = SnapshotPlanStore.get_snapshot
+    original_save_updates = SnapshotPlanStore.save_serialized_snapshot_updates
+    update_batch_sizes = []
+
+    def fail_if_coordinator_hydrates_snapshot(self, snapshot_id, *, new_only=False):
+        raise AssertionError(f"coordinator hydrated snapshot '{snapshot_id}'")
+
+    def record_update_batch(self, snapshots, *, connection=None):
+        snapshots = tuple(snapshots)
+        update_batch_sizes.append(len(snapshots))
+        original_save_updates(self, snapshots, connection=connection)
+
+    monkeypatch.setattr(SnapshotPlanStore, "get_snapshot", fail_if_coordinator_hydrates_snapshot)
+    monkeypatch.setattr(
+        SnapshotPlanStore, "save_serialized_snapshot_updates", record_update_batch
+    )
+
+    plan = builder.build()
+
+    assert len(plan.new_snapshots) == 8
+    assert sum(update_batch_sizes) == 8
+    assert max(update_batch_sizes) <= builder._streaming_workers
+    for snapshot_id in builder._context_diff.added:
+        snapshot = original_get_snapshot(store, snapshot_id)
+        assert snapshot.categorized
+        assert plan.deployability_index.is_deployable(snapshot)
+
+
 def test_streaming_full_load_diff_marks_new_snapshots_without_hydrating_payloads(
     tmp_path, monkeypatch
 ):

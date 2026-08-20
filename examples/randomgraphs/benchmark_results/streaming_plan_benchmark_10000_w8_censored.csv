@@ -1,0 +1,2 @@
+commit,image,planner_mode,workers,width,seed,models,status,elapsed_lower_bound_seconds,observed_cgroup_mib_at_stop,measurement_note
+c9b6bed1,randomgraphs-sqlmesh-streaming-iterator:latest,streaming,8,10000,0,70000,aborted_by_user,28416,1251.328000,"Plan did not complete; stopped during a later serial topological pass. Memory is the rounded live Docker cgroup reading at stop, not memory.peak."

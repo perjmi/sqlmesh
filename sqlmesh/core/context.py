@@ -2094,6 +2094,11 @@ class GenericContext(BaseContext, t.Generic[C]):
             ),
             explain=explain or False,
             ignore_cron=ignore_cron or False,
+            streaming_workers=min(
+                self.config.planner.streaming_workers,
+                c.MAX_FORK_WORKERS or self.config.planner.streaming_workers,
+            ),
+            streaming_worker_max_tasks=self.config.planner.streaming_worker_max_tasks,
         )
 
     def apply(

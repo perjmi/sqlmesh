@@ -90,7 +90,10 @@ CANDIDATE_PLANNER_MODE=streaming pytest -q -o addopts='' -p no:cacheprovider \
 Native streaming plans use two bounded workers by default in this suite. Override
 `STREAMING_WORKERS` to control parallelism and `STREAMING_WORKER_MAX_TASKS` to control how often
 worker processes are recycled. The coordinator remains the sole SQLite writer; workers persist
-model payloads independently and return compact metadata or serialized snapshots.
+model payloads independently and return compact metadata or serialized snapshots. Added-snapshot
+categorization and development-plan deployability are finalized in bounded worker batches as well;
+serialized results are drained after at most one result per worker so the coordinator does not
+accumulate a growing queue of hydrated models.
 
 The mutation regression suite goes further by giving both databases the same randomized owner,
 schema, and audit baseline, then applying the same deterministic sequence of input-data, filter,

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 import typing as t
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, Future, as_completed, wait
 from functools import cached_property
 from datetime import datetime
 
@@ -23,7 +25,21 @@ from sqlmesh.core.plan.definition import (
     UserProvidedFlags,
     earliest_interval_start,
 )
-from sqlmesh.core.plan.store import IndexedSnapshotDAG, IndexedSnapshotMapping
+from sqlmesh.core.plan.store import (
+    IndexedSnapshotDAG,
+    IndexedSnapshotMapping,
+    SerializedSnapshotUpdate,
+    SnapshotPlanStore,
+)
+from sqlmesh.core.plan.streaming import (
+    StreamingCategorizationTask,
+    StreamingDeployabilityResult,
+    StreamingDeployabilityTask,
+    categorize_streaming_snapshot,
+    close_streaming_plan_worker,
+    compute_streaming_deployability,
+    init_streaming_plan_worker,
+)
 from sqlmesh.core.schema_diff import (
     get_schema_differ,
     has_drop_alteration,
@@ -49,6 +65,7 @@ from sqlmesh.utils.date import (
     is_relative,
 )
 from sqlmesh.utils.errors import NoChangesPlanError, PlanError
+from sqlmesh.utils.process import PoolExecutor, create_process_pool_executor
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +116,8 @@ class PlanBuilder:
         end_override_per_model: A mapping of model FQNs to target end dates.
         ignore_cron: Whether to ignore the node's cron schedule when computing missing intervals.
         explain: Whether to explain the plan instead of applying it.
+        streaming_workers: Maximum workers for independent streaming planner finalization.
+        streaming_worker_max_tasks: Maximum snapshots processed before recycling the worker pool.
     """
 
     def __init__(
@@ -139,7 +158,13 @@ class PlanBuilder:
         console: t.Optional[PlanBuilderConsole] = None,
         user_provided_flags: t.Optional[t.Dict[str, UserProvidedFlags]] = None,
         selected_models: t.Optional[t.Set[str]] = None,
+        streaming_workers: int = 1,
+        streaming_worker_max_tasks: int = 25,
     ):
+        if streaming_workers <= 0:
+            raise ValueError("streaming_workers must be greater than 0")
+        if streaming_worker_max_tasks <= 0:
+            raise ValueError("streaming_worker_max_tasks must be greater than 0")
         self._context_diff = context_diff
         self._no_gaps = no_gaps
         self._skip_backfill = skip_backfill
@@ -165,6 +190,8 @@ class PlanBuilder:
         self._categorizer_config = categorizer_config or CategorizerConfig()
         self._auto_categorization_enabled = auto_categorization_enabled
         self._include_unmodified = include_unmodified
+        self._streaming_workers = streaming_workers
+        self._streaming_worker_max_tasks = streaming_worker_max_tasks
         self._restate_models = set(restate_models) if restate_models is not None else None
         self._restate_all_snapshots = restate_all_snapshots
         self._effective_from = effective_from
@@ -325,10 +352,12 @@ class PlanBuilder:
             else DeployabilityIndex.all_deployable()
         )
 
-        restatements = self._build_restatements(
-            dag,
-            self._earliest_interval_start(),
+        earliest_interval_start = (
+            self._earliest_interval_start()
+            if self._restate_models or self._forward_only_preview_needed
+            else yesterday_ds()
         )
+        restatements = self._build_restatements(dag, earliest_interval_start)
         models_to_backfill = self._build_models_to_backfill(dag, restatements)
 
         if isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
@@ -419,84 +448,18 @@ class PlanBuilder:
                 )
                 """
             )
-            for snapshot_id in IndexedSnapshotDAG(store, store.write_batch_size):
-                snapshot = store.snapshots[snapshot_id]
-                parent_state = connection.execute(
-                    """
-                    SELECT MIN(state.start_ts) AS start_ts,
-                           MIN(state.children_deployable) AS children_deployable
-                    FROM snapshot_edges AS edge
-                    JOIN deployability_state AS state
-                      ON state.name = edge.parent_name
-                     AND state.identifier = edge.parent_identifier
-                    WHERE edge.child_name = ? AND edge.child_identifier = ?
-                    """,
-                    (snapshot_id.name, snapshot_id.identifier),
-                ).fetchone()
-
-                if snapshot.name in start_overrides:
-                    snapshot_start = start_overrides[snapshot.name]
-                elif snapshot.node.start:
-                    snapshot_start = to_datetime(snapshot.node.start)
-                elif parent_state["start_ts"] is not None:
-                    snapshot_start = to_datetime(parent_state["start_ts"])
-                else:
-                    snapshot_start = snapshot.node.cron_prev(snapshot.node.cron_floor(now()))
-
-                this_deployable = snapshot.virtual_environment_mode.is_full and (
-                    parent_state["children_deployable"] is None
-                    or bool(parent_state["children_deployable"])
+            connection.execute(
+                """
+                CREATE TEMP TABLE deployability_batch (
+                    name TEXT NOT NULL,
+                    identifier TEXT NOT NULL,
+                    PRIMARY KEY(name, identifier)
                 )
-                representative = False
-                if this_deployable:
-                    is_forward_only_model = (
-                        snapshot.is_model
-                        and snapshot.model.forward_only
-                        and not snapshot.is_metadata
-                    )
-                    has_auto_restatement = (
-                        snapshot.is_model and snapshot.model.auto_restatement_cron is not None
-                    )
-                    is_valid_start = (
-                        snapshot.is_valid_start(self._start, snapshot_start)
-                        if self._start is not None
-                        else True
-                    )
-                    children_deployable = is_valid_start and not has_auto_restatement
-                    if (
-                        snapshot.is_forward_only
-                        or snapshot.is_indirect_non_breaking
-                        or is_forward_only_model
-                        or has_auto_restatement
-                        or not is_valid_start
-                    ):
-                        this_deployable = False
-                        if not snapshot.is_paused or (
-                            snapshot.is_indirect_non_breaking and snapshot.intervals
-                        ):
-                            representative = True
-                        else:
-                            children_deployable = False
-                else:
-                    children_deployable = False
-                    representative = not snapshot.is_paused
-
-                connection.execute(
-                    """
-                    INSERT INTO deployability_state(
-                        name, identifier, start_ts, deployable,
-                        children_deployable, representative
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        snapshot_id.name,
-                        snapshot_id.identifier,
-                        to_timestamp(snapshot_start),
-                        this_deployable,
-                        children_deployable,
-                        representative,
-                    ),
-                )
+                """
+            )
+            self._build_streaming_deployability_state(
+                store, connection, start_overrides, evaluation_time=now()
+            )
 
             counts = connection.execute(
                 """
@@ -535,6 +498,122 @@ class PlanBuilder:
             )
         finally:
             connection.close()
+
+    def _build_streaming_deployability_state(
+        self,
+        store: SnapshotPlanStore,
+        connection: sqlite3.Connection,
+        start_overrides: t.Mapping[str, TimeLike],
+        evaluation_time: datetime,
+    ) -> None:
+        """Builds deployability state using bounded read workers and one SQLite writer."""
+        task_capacity = self._streaming_workers * self._streaming_worker_max_tasks
+        executor: t.Optional[PoolExecutor] = None
+        tasks_in_executor = 0
+        try:
+            for snapshot_ids in store.iter_topological_batches(store.write_batch_size):
+                offset = 0
+                while offset < len(snapshot_ids):
+                    if executor is None:
+                        executor = create_process_pool_executor(
+                            initializer=init_streaming_plan_worker,
+                            initargs=(str(store.path),),
+                            max_workers=self._streaming_workers,
+                        )
+                        tasks_in_executor = 0
+
+                    available_capacity = task_capacity - tasks_in_executor
+                    selected_ids = snapshot_ids[offset : offset + available_capacity]
+                    parent_states = self._streaming_parent_deployability_states(
+                        connection, selected_ids
+                    )
+                    futures: t.List[Future[StreamingDeployabilityResult]] = []
+                    for snapshot_id in selected_ids:
+                        parent_start_ts, parent_children_deployable = parent_states[snapshot_id]
+                        futures.append(
+                            executor.submit(
+                                compute_streaming_deployability,
+                                StreamingDeployabilityTask(
+                                    snapshot_id=snapshot_id,
+                                    plan_start=self._start,
+                                    start_override=start_overrides.get(snapshot_id.name),
+                                    parent_start_ts=parent_start_ts,
+                                    parent_children_deployable=parent_children_deployable,
+                                    evaluation_time=evaluation_time,
+                                ),
+                            )
+                        )
+                    results = [future.result() for future in as_completed(futures)]
+                    self._save_streaming_deployability_results(connection, results)
+
+                    selected_count = len(selected_ids)
+                    offset += selected_count
+                    tasks_in_executor += selected_count
+                    if tasks_in_executor == task_capacity:
+                        executor.shutdown(wait=True)
+                        executor = None
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+            close_streaming_plan_worker()
+
+    @staticmethod
+    def _streaming_parent_deployability_states(
+        connection: sqlite3.Connection, snapshot_ids: t.Collection[SnapshotId]
+    ) -> t.Dict[SnapshotId, t.Tuple[t.Optional[int], t.Optional[bool]]]:
+        connection.execute("DELETE FROM deployability_batch")
+        connection.executemany(
+            "INSERT INTO deployability_batch(name, identifier) VALUES (?, ?)",
+            ((snapshot_id.name, snapshot_id.identifier) for snapshot_id in snapshot_ids),
+        )
+        rows = connection.execute(
+            """
+            SELECT batch.name, batch.identifier,
+                   MIN(state.start_ts) AS start_ts,
+                   MIN(state.children_deployable) AS children_deployable
+            FROM deployability_batch AS batch
+            LEFT JOIN snapshot_edges AS edge
+              ON edge.child_name = batch.name
+             AND edge.child_identifier = batch.identifier
+            LEFT JOIN deployability_state AS state
+              ON state.name = edge.parent_name
+             AND state.identifier = edge.parent_identifier
+            GROUP BY batch.name, batch.identifier
+            """
+        )
+        return {
+            SnapshotId(name=row["name"], identifier=row["identifier"]): (
+                row["start_ts"],
+                bool(row["children_deployable"])
+                if row["children_deployable"] is not None
+                else None,
+            )
+            for row in rows
+        }
+
+    @staticmethod
+    def _save_streaming_deployability_results(
+        connection: sqlite3.Connection, results: t.Iterable[StreamingDeployabilityResult]
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT INTO deployability_state(
+                name, identifier, start_ts, deployable,
+                children_deployable, representative
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    result.snapshot_id.name,
+                    result.snapshot_id.identifier,
+                    result.start_ts,
+                    result.deployable,
+                    result.children_deployable,
+                    result.representative,
+                )
+                for result in results
+            ),
+        )
 
     def _earliest_interval_start(self) -> datetime:
         if not isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
@@ -773,6 +852,13 @@ class PlanBuilder:
         )
         if backfill_models is None:
             return None
+        if isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
+            return {
+                snapshot_id.name
+                for snapshot_id in self._context_diff.snapshots.store.snapshots_with_upstream(
+                    backfill_models
+                )
+            }
         return {
             self._context_diff.snapshots[s_id].name
             for s_id in dag.subdag(
@@ -875,9 +961,17 @@ class PlanBuilder:
         indirectly modified snapshots.
         """
 
-        # Iterating in DAG order since a category for a snapshot may depend on the categories
-        # assigned to its upstream dependencies.
+        categorized_added: t.Collection[SnapshotId] = ()
+        if isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
+            categorized_added = self._categorize_added_snapshots_streaming()
+            if len(categorized_added) == len(self._context_diff.new_snapshots):
+                return
+
+        # Modified snapshots remain in DAG order since their categories may depend on categories
+        # assigned to upstream dependencies. Newly added snapshots were handled independently above.
         for s_id in dag:
+            if s_id in categorized_added:
+                continue
             snapshot = self._context_diff.snapshots.get(s_id)
 
             if not snapshot or not self._is_new_snapshot(snapshot):
@@ -903,6 +997,73 @@ class PlanBuilder:
                     _, old = self._context_diff.modified_snapshots[s_id.name]
                     self._context_diff.modified_snapshots[s_id.name] = (snapshot, old)
             self._save_streaming_snapshot(snapshot)
+
+    def _categorize_added_snapshots_streaming(self) -> t.Collection[SnapshotId]:
+        """Categorizes independent added snapshots in bounded workers and writes them in order."""
+        snapshots = t.cast(IndexedSnapshotMapping, self._context_diff.snapshots)
+        snapshot_ids = sorted(self._context_diff.added)
+        if not snapshot_ids:
+            return ()
+
+        store = snapshots.store
+        task_capacity = self._streaming_workers * self._streaming_worker_max_tasks
+        try:
+            for offset in range(0, len(snapshot_ids), task_capacity):
+                pool_snapshot_ids = snapshot_ids[offset : offset + task_capacity]
+                with (
+                    create_process_pool_executor(
+                        initializer=init_streaming_plan_worker,
+                        initargs=(str(store.path),),
+                        max_workers=self._streaming_workers,
+                    ) as executor,
+                    store._connect() as update_connection,
+                ):
+                    snapshot_id_iterator = iter(pool_snapshot_ids)
+                    futures: t.Set[Future[SerializedSnapshotUpdate]] = set()
+
+                    def submit_next_snapshot() -> bool:
+                        try:
+                            snapshot_id = next(snapshot_id_iterator)
+                        except StopIteration:
+                            return False
+                        futures.add(
+                            executor.submit(
+                                categorize_streaming_snapshot,
+                                StreamingCategorizationTask(
+                                    snapshot_id=snapshot_id,
+                                    category=self._choices.get(
+                                        snapshot_id, SnapshotChangeCategory.BREAKING
+                                    ),
+                                    forward_only=self._forward_only,
+                                    effective_from=self._effective_from,
+                                ),
+                            )
+                        )
+                        return True
+
+                    for _ in range(self._streaming_workers):
+                        if not submit_next_snapshot():
+                            break
+
+                    while futures:
+                        completed, pending = wait(futures, return_when=FIRST_COMPLETED)
+                        futures = set(pending)
+                        updates = [future.result() for future in completed]
+                        updates.sort(
+                            key=lambda update: (
+                                update.snapshot_id.name,
+                                update.snapshot_id.identifier,
+                            )
+                        )
+                        store.save_serialized_snapshot_updates(
+                            updates, connection=update_connection
+                        )
+                        for _ in completed:
+                            submit_next_snapshot()
+        finally:
+            close_streaming_plan_worker()
+
+        return self._context_diff.added
 
     def _categorize_snapshot(
         self,
@@ -1059,7 +1220,17 @@ class PlanBuilder:
             if to_datetime(self._effective_from) > now():
                 raise PlanError("Effective date cannot be in the future.")
 
-        for snapshot in self._context_diff.new_snapshots.values():
+        new_snapshots = self._context_diff.new_snapshots
+        snapshot_ids = iter(new_snapshots)
+        if isinstance(new_snapshots, IndexedSnapshotMapping):
+            snapshot_ids = (
+                snapshot_id
+                for snapshot_id in snapshot_ids
+                if snapshot_id not in self._context_diff.added
+            )
+
+        for snapshot_id in snapshot_ids:
+            snapshot = new_snapshots[snapshot_id]
             if (
                 snapshot.evaluatable
                 and not snapshot.disable_restatement
@@ -1129,6 +1300,8 @@ class PlanBuilder:
                             )
 
     def _ensure_no_broken_references(self) -> None:
+        if not self._context_diff.removed_snapshots:
+            return
         for snapshot in self._context_diff.snapshots.values():
             broken_references = {
                 x.name for x in self._context_diff.removed_snapshots.values() if not x.is_external
