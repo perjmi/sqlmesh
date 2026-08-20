@@ -6,9 +6,9 @@ import sqlite3
 import typing as t
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, as_completed, wait
-from functools import cached_property
 from datetime import datetime
-
+from functools import cached_property
+from itertools import islice
 
 from sqlmesh.core.console import PlanBuilderConsole, get_console
 from sqlmesh.core.config import (
@@ -1001,15 +1001,18 @@ class PlanBuilder:
     def _categorize_added_snapshots_streaming(self) -> t.Collection[SnapshotId]:
         """Categorizes independent added snapshots in bounded workers and writes them in order."""
         snapshots = t.cast(IndexedSnapshotMapping, self._context_diff.snapshots)
-        snapshot_ids = sorted(self._context_diff.added)
-        if not snapshot_ids:
+        if not self._context_diff.added:
             return ()
 
         store = snapshots.store
         task_capacity = self._streaming_workers * self._streaming_worker_max_tasks
+        snapshot_ids = (
+            snapshot_id
+            for snapshot_id in store.iter_snapshot_ids(new_only=True)
+            if snapshot_id in self._context_diff.added
+        )
         try:
-            for offset in range(0, len(snapshot_ids), task_capacity):
-                pool_snapshot_ids = snapshot_ids[offset : offset + task_capacity]
+            while pool_snapshot_ids := tuple(islice(snapshot_ids, task_capacity)):
                 with (
                     create_process_pool_executor(
                         initializer=init_streaming_plan_worker,

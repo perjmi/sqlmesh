@@ -2731,6 +2731,13 @@ def test_streaming_finalizes_added_snapshots_without_coordinator_hydration(
     )
     builder = context.plan_builder("dev", skip_tests=True, skip_backfill=True)
     store = builder._context_diff.snapshots.store
+    added_snapshot_ids = tuple(builder._context_diff.added)
+
+    class MembershipOnlySnapshotIds(set):
+        def __iter__(self):
+            raise AssertionError("added snapshot IDs must be consumed from the plan store")
+
+    builder._context_diff.added = MembershipOnlySnapshotIds(added_snapshot_ids)
     original_get_snapshot = SnapshotPlanStore.get_snapshot
     original_save_updates = SnapshotPlanStore.save_serialized_snapshot_updates
     update_batch_sizes = []
@@ -2753,7 +2760,7 @@ def test_streaming_finalizes_added_snapshots_without_coordinator_hydration(
     assert len(plan.new_snapshots) == 8
     assert sum(update_batch_sizes) == 8
     assert max(update_batch_sizes) <= builder._streaming_workers
-    for snapshot_id in builder._context_diff.added:
+    for snapshot_id in added_snapshot_ids:
         snapshot = original_get_snapshot(store, snapshot_id)
         assert snapshot.categorized
         assert plan.deployability_index.is_deployable(snapshot)
