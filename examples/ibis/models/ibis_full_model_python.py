@@ -1,9 +1,8 @@
 import typing as t
 from datetime import datetime
 
-import ibis  # type: ignore
 import pandas as pd  # noqa: TID253
-from constants import DB_PATH  # type: ignore
+from constants import create_ibis_connection  # type: ignore
 from sqlglot import exp
 
 from sqlmesh import ExecutionContext, model
@@ -30,10 +29,10 @@ def execute(
     # get physical table name
     upstream_model = exp.to_table(context.resolve_table("ibis.incremental_model"))
     # connect ibis to database
-    con = ibis.duckdb.connect(DB_PATH)
+    con = create_ibis_connection()
 
     # retrieve table
-    incremental_model = con.table(name=upstream_model.name, database=upstream_model.db)
+    incremental_model = con.table(upstream_model.name, database=upstream_model.db)
 
     # build query
     count = incremental_model.id.nunique()

@@ -4,5 +4,15 @@ gateways:
       type: duckdb
       catalogs:
         local: 'data/local.duckdb'
+  postgres:
+    connection:
+      type: postgres
+      host: {{ env_var('POSTGRES_HOST', 'localhost') }}
+      port: {{ env_var('POSTGRES_PORT', '5432') }}
+      user: {{ env_var('POSTGRES_USER', 'postgres') }}
+      password: {{ env_var('POSTGRES_PASSWORD', 'postgres') }}
+      database: {{ env_var('POSTGRES_DB', 'sqlmesh') }}
+      check_import: false
+default_gateway: {{ env_var('SQLMESH_GATEWAY', 'my_gateway') }}
 model_defaults:
-  dialect: 'duckdb'
+  dialect: {{ env_var('SQLMESH_DIALECT', 'duckdb') }}
