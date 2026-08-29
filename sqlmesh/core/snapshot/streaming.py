@@ -5,8 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sqlmesh.core.config import TableNamingConvention
+from sqlmesh.core.model import ModelKindName
 from sqlmesh.core.model.graph import ProjectGraphIndex
-from sqlmesh.core.model.registry import ModelPayloadStore, ModelRegistry
+from sqlmesh.core.model.registry import ModelMetadata, ModelPayloadStore, ModelRegistry
 from sqlmesh.core.plan.store import SerializedSnapshot
 from sqlmesh.core.snapshot.definition import Snapshot, SnapshotFingerprint, SnapshotId
 from sqlmesh.utils.hashing import hash_data
@@ -51,8 +52,7 @@ def build_serialized_streaming_snapshot(task: StreamingSnapshotTask) -> Serializ
                 name=parent,
                 identifier=index.fingerprint(parent).to_identifier(),
             )
-            for parent in metadata.dependencies
-            if index.contains(parent)
+            for parent in _snapshot_parent_names(index, metadata)
         ),
         intervals=[],
         dev_intervals=[],
@@ -62,6 +62,21 @@ def build_serialized_streaming_snapshot(task: StreamingSnapshotTask) -> Serializ
         table_naming_convention=task.table_naming_convention,
     )
     return SerializedSnapshot.from_snapshot(snapshot, is_new=False)
+
+
+def _snapshot_parent_names(index: ProjectGraphIndex, metadata: ModelMetadata) -> t.Tuple[str, ...]:
+    """Returns direct parents plus physical parents hidden behind embedded models."""
+    parents: t.Set[str] = set()
+    pending = list(metadata.dependencies)
+    while pending:
+        parent = pending.pop()
+        if parent in parents or not index.contains(parent):
+            continue
+        parents.add(parent)
+        parent_metadata = index.metadata(parent)
+        if parent_metadata.kind_name == str(ModelKindName.EMBEDDED):
+            pending.extend(parent_metadata.dependencies)
+    return tuple(sorted(parents))
 
 
 class StreamingFingerprinter:

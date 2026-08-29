@@ -5,15 +5,22 @@ from pathlib import Path
 import pytest
 from sqlglot import parse_one
 
+from sqlmesh.core.config import TableNamingConvention
 from sqlmesh.core.model import create_sql_model
 from sqlmesh.core.model.graph import IndexedDAG, ProjectGraphIndex
 from sqlmesh.core.model.registry import IndexedModelRegistry, ModelMetadata, ModelPayloadStore
 from sqlmesh.core.model.schema import update_model_schemas_streaming
 from sqlmesh.core.selector import MetadataSelector
 from sqlmesh.core.snapshot.definition import fingerprint_from_node
-from sqlmesh.core.snapshot.streaming import StreamingFingerprinter
+from sqlmesh.core.snapshot.streaming import (
+    StreamingFingerprinter,
+    StreamingSnapshotTask,
+    build_serialized_streaming_snapshot,
+    init_streaming_snapshot_worker,
+)
 from sqlmesh.core.context_diff_streaming import CompactContextDiff
 from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory
+from sqlmesh.core.plan.store import deserialize_snapshot
 from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils.dag import DAG
 
@@ -346,6 +353,51 @@ def test_streaming_fingerprints_match_eager_without_model_hydration(tmp_path):
     assert registry.max_cache_size_seen == 0
     assert registry.cache_size == 0
     assert index.fingerprint(model_c.fqn) == expected[model_c.fqn]
+
+
+def test_streaming_snapshot_includes_physical_parents_of_embedded_models(tmp_path):
+    seed = create_sql_model("db.seed", parse_one("SELECT 1 AS id"), kind="FULL")
+    embedded = create_sql_model(
+        "db.embedded",
+        parse_one("SELECT * FROM db.seed"),
+        kind="EMBEDDED",
+        depends_on={seed.fqn},
+    )
+    downstream = create_sql_model(
+        "db.downstream",
+        parse_one("SELECT * FROM db.embedded"),
+        kind="FULL",
+        depends_on={embedded.fqn},
+    )
+    models = {model.fqn: model for model in (seed, embedded, downstream)}
+    index = ProjectGraphIndex(tmp_path / "graph.sqlite")
+    metadata = [ModelMetadata.from_model(model) for model in models.values()]
+    index.replace(metadata)
+    payloads = ModelPayloadStore(tmp_path / "payloads")
+    for record in metadata:
+        payloads.put(models[record.fqn], record)
+    list(
+        StreamingFingerprinter(
+            index,
+            IndexedModelRegistry(index, lambda name: models[name], max_entries=1),
+            batch_size=1,
+        ).fingerprint()
+    )
+    init_streaming_snapshot_worker(str(index.path), str(tmp_path / "payloads"))
+
+    serialized = build_serialized_streaming_snapshot(
+        StreamingSnapshotTask(
+            name=downstream.fqn,
+            created_ts=1,
+            ttl="in 1 week",
+            table_naming_convention=TableNamingConvention.default,
+        )
+    )
+    streamed = deserialize_snapshot(serialized.payload)
+    eager = Snapshot.from_node(downstream, nodes=models)
+
+    assert streamed.parents == eager.parents
+    assert {parent.name for parent in streamed.parents} == {seed.fqn, embedded.fqn}
 
 
 def test_topological_batches_reject_cycles(tmp_path):

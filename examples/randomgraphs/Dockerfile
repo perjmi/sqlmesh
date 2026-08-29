@@ -12,7 +12,7 @@ COPY pyproject.toml README.md LICENSE ./
 COPY sqlmesh ./sqlmesh
 COPY sqlmesh_dbt ./sqlmesh_dbt
 
-RUN pip install . psycopg2-binary
+RUN pip install . psycopg2-binary pymysql
 
 COPY examples/randomgraphs ./examples/randomgraphs
 

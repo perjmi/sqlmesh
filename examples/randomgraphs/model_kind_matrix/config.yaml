@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+
+gateways:
+  matrix:
+    connection:
+{% if env_var('MATRIX_ENGINE', 'duckdb') == 'postgres' %}
+      type: postgres
+      host: {{ env_var('POSTGRES_HOST', 'localhost') }}
+      port: {{ env_var('POSTGRES_PORT', '5432') }}
+      user: {{ env_var('POSTGRES_USER', 'postgres') }}
+      password: {{ env_var('POSTGRES_PASSWORD', 'postgres') }}
+      database: {{ env_var('POSTGRES_DB', 'sqlmesh') }}
+      check_import: false
+{% elif env_var('MATRIX_ENGINE', 'duckdb') == 'mysql' %}
+      type: mysql
+      host: {{ env_var('MYSQL_HOST', 'localhost') }}
+      port: {{ env_var('MYSQL_PORT', '3306') }}
+      user: {{ env_var('MYSQL_USER', 'root') }}
+      password: {{ env_var('MYSQL_PASSWORD', 'mysql') }}
+      database: {{ env_var('MYSQL_DB', 'sqlmesh') }}
+      charset: utf8mb4
+      check_import: false
+{% else %}
+      type: duckdb
+      database: {{ env_var('DUCKDB_PATH', '/tmp/model-kind-matrix.duckdb') }}
+{% endif %}
+default_gateway: matrix
+cache_dir: {{ env_var('SQLMESH_CACHE_DIR', '.cache') }}
+variables:
+  matrix_value: {{ env_var('MATRIX_VALUE', '0') }}
+model_defaults:
+  dialect: {{ env_var('MATRIX_ENGINE', 'duckdb') }}
+  start: '2024-01-01'

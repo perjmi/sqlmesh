@@ -152,6 +152,33 @@ single-entry batches/caches and with uneven batch widths across two frequently r
 The compose harness accepts `MODEL_BATCH_SIZE`, `SNAPSHOT_BATCH_SIZE`,
 `HYDRATED_MODEL_CACHE_SIZE`, and `HYDRATED_SNAPSHOT_CACHE_SIZE` in addition to the worker settings.
 
+The portable model-kind matrix runs the same eager-versus-streaming lifecycle against PostgreSQL,
+MySQL, and DuckDB. It covers SEED, EMBEDDED, FULL, VIEW, INCREMENTAL_BY_TIME_RANGE,
+INCREMENTAL_BY_UNIQUE_KEY, SCD_TYPE_2_BY_TIME, and SCD_TYPE_2_BY_COLUMN models. Each engine runs an
+initial deployment, a repeated no-change plan, simultaneous direct changes across all five physical
+SQL model kinds, development-environment creation, and a bounded time-range restatement. After every
+phase the suite compares normalized snapshots, intervals, environments, and every ordered physical
+model row. CUSTOM and MANAGED models remain engine/materialization-specific, while EXTERNAL models
+require an independently provisioned source and are therefore kept out of this portable execution
+matrix.
+
+The randomgraphs Docker image includes the PostgreSQL and MySQL Python drivers; DuckDB is installed
+by SQLMesh itself. For an older reference image without `pymysql`, the test builds and caches a thin
+driver-enabled derivative without changing its SQLMesh source. Build the reference and candidate
+images, then run all three engine rows with:
+
+```bash
+REFERENCE_SQLMESH_IMAGE=randomgraphs-sqlmesh-main:latest \
+CANDIDATE_SQLMESH_IMAGE=randomgraphs-sqlmesh-streaming-iterator:latest \
+CANDIDATE_PLANNER_MODE=streaming \
+pytest -q -o addopts='' -p no:cacheprovider \
+  tests/test_dual_planner_model_kind_matrix.py
+```
+
+Use `-k postgres`, `-k mysql`, or `-k duckdb` for a single engine. The dedicated
+`compose.model-kinds.yaml` stack gives each planner its own server/database or DuckDB volume and is
+removed, including volumes, after each engine row.
+
 For multi-process memory comparisons, use `cgroup_peak_mib` from `benchmark_branch_plans.py` as the
 primary whole-container measurement. Aggregate RSS remains in the output for continuity but counts
 fork-shared pages once per process.

@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: Apache-2.0
+
+services:
+  reference_postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: sqlmesh
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sqlmesh"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  candidate_postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: sqlmesh
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sqlmesh"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  reference_mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: sqlmesh
+      MYSQL_ROOT_PASSWORD: mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -pmysql --silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    tmpfs:
+      - /var/lib/mysql
+
+  candidate_mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: sqlmesh
+      MYSQL_ROOT_PASSWORD: mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -pmysql --silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    tmpfs:
+      - /var/lib/mysql
+
+  reference:
+    image: ${REFERENCE_SQLMESH_IMAGE:-randomgraphs-sqlmesh}
+    working_dir: /workspace/examples/randomgraphs/model_kind_matrix
+    environment:
+      POSTGRES_HOST: reference_postgres
+      POSTGRES_DB: sqlmesh
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      MYSQL_HOST: reference_mysql
+      MYSQL_DB: sqlmesh
+      MYSQL_USER: root
+      MYSQL_PASSWORD: mysql
+      DUCKDB_PATH: /matrix-data/matrix.duckdb
+      SQLMESH_CACHE_DIR: /tmp/sqlmesh-cache
+      PYTHONDONTWRITEBYTECODE: 1
+    volumes:
+      - .:/workspace/examples/randomgraphs:ro
+      - reference_duckdb:/matrix-data
+    tmpfs:
+      - /tmp
+
+  candidate:
+    image: ${CANDIDATE_SQLMESH_IMAGE:-randomgraphs-sqlmesh}
+    working_dir: /workspace/examples/randomgraphs/model_kind_matrix
+    environment:
+      POSTGRES_HOST: candidate_postgres
+      POSTGRES_DB: sqlmesh
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      MYSQL_HOST: candidate_mysql
+      MYSQL_DB: sqlmesh
+      MYSQL_USER: root
+      MYSQL_PASSWORD: mysql
+      DUCKDB_PATH: /matrix-data/matrix.duckdb
+      SQLMESH_CACHE_DIR: /tmp/sqlmesh-cache
+      PYTHONDONTWRITEBYTECODE: 1
+      SQLMESH__PLANNER__MODE: ${CANDIDATE_PLANNER_MODE:-streaming}
+      SQLMESH__PLANNER__MODEL_BATCH_SIZE: ${MODEL_BATCH_SIZE:-3}
+      SQLMESH__PLANNER__SNAPSHOT_BATCH_SIZE: ${SNAPSHOT_BATCH_SIZE:-3}
+      SQLMESH__PLANNER__HYDRATED_MODEL_CACHE_SIZE: ${HYDRATED_MODEL_CACHE_SIZE:-4}
+      SQLMESH__PLANNER__HYDRATED_SNAPSHOT_CACHE_SIZE: ${HYDRATED_SNAPSHOT_CACHE_SIZE:-4}
+      SQLMESH__PLANNER__STREAMING_WORKERS: ${STREAMING_WORKERS:-2}
+      SQLMESH__PLANNER__STREAMING_WORKER_MAX_TASKS: ${STREAMING_WORKER_MAX_TASKS:-3}
+      MAX_FORK_WORKERS: ${STREAMING_WORKERS:-2}
+    volumes:
+      - .:/workspace/examples/randomgraphs:ro
+      - candidate_duckdb:/matrix-data
+    tmpfs:
+      - /tmp
+
+volumes:
+  reference_duckdb:
+  candidate_duckdb:
