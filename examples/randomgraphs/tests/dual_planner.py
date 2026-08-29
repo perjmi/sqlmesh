@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import re
 import subprocess
 from dataclasses import dataclass
@@ -20,11 +21,13 @@ DATABASE_SERVICE = {"reference": "reference_db", "candidate": "candidate_db"}
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
-def run(*args: str, capture_output: bool = True) -> subprocess.CompletedProcess[str]:
+def run(
+    *args: str, capture_output: bool = True, check: bool = True
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
         cwd=PROJECT_PATH,
-        check=True,
+        check=check,
         capture_output=capture_output,
         text=True,
     )
@@ -47,7 +50,42 @@ def reset_database(target: str) -> None:
     run(*COMPOSE, "exec", "-T", service, "createdb", "-U", "postgres", "sqlmesh")
 
 
-def plan(target: str, selected_models: tuple[str, ...] = ()) -> str:
+def randomized_plan_options(
+    option_groups: tuple[tuple[str, ...], ...], *, seed: int
+) -> tuple[str, ...]:
+    """Return a reproducibly shuffled CLI argument list while keeping option values together."""
+    shuffled = list(option_groups)
+    random.Random(seed).shuffle(shuffled)
+    return tuple(value for group in shuffled for value in group)
+
+
+def plan(
+    target: str,
+    selected_models: tuple[str, ...] = (),
+    *,
+    environment: str | None = None,
+    option_groups: tuple[tuple[str, ...], ...] = (),
+    permutation_seed: int = 0,
+) -> str:
+    result = plan_result(
+        target,
+        selected_models,
+        environment=environment,
+        option_groups=option_groups,
+        permutation_seed=permutation_seed,
+    )
+    result.check_returncode()
+    return result.stdout
+
+
+def plan_result(
+    target: str,
+    selected_models: tuple[str, ...] = (),
+    *,
+    environment: str | None = None,
+    option_groups: tuple[tuple[str, ...], ...] = (),
+    permutation_seed: int = 0,
+) -> subprocess.CompletedProcess[str]:
     command = [
         *COMPOSE,
         "run",
@@ -58,12 +96,17 @@ def plan(target: str, selected_models: tuple[str, ...] = ()) -> str:
         "--log-file-dir",
         "/tmp/sqlmesh-logs",
         "plan",
-        "--auto-apply",
-        "--no-prompts",
     ]
-    for model_name in selected_models:
-        command.extend(("--select-model", model_name))
-    return run(*command).stdout
+    if environment is not None:
+        command.append(environment)
+    groups = [
+        ("--auto-apply",),
+        ("--no-prompts",),
+        *(("--select-model", model_name) for model_name in selected_models),
+        *option_groups,
+    ]
+    command.extend(randomized_plan_options(tuple(groups), seed=permutation_seed))
+    return run(*command, check=False)
 
 
 def query(target: str, sql: str) -> tuple[str, ...]:

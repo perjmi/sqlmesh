@@ -114,6 +114,21 @@ Use `RANDOMGRAPHS_MUTATION_TIER=sweep10` for ten independent smoke-sized seeds, 
 becomes expensive at the larger tiers; it is an independent correctness oracle rather than a
 performance benchmark.
 
+The plan-option suite reproducibly shuffles complete option groups so a flag always stays next to
+its value while argument order varies. It compares eager and streaming behavior for production and
+development plans, repeated no-change plans, restatement and selective backfill, forward-only and
+preview plans, non-backfill modes, run controls, rendered diffs, fixed execution times, and plans
+with automatic categorization disabled:
+
+```bash
+REFERENCE_SQLMESH_IMAGE=randomgraphs-sqlmesh-main:latest \
+CANDIDATE_SQLMESH_IMAGE=randomgraphs-sqlmesh-streaming-iterator:latest \
+CANDIDATE_PLANNER_MODE=streaming \
+pytest -q -o addopts='' -p no:cacheprovider tests/test_dual_planner_options.py
+```
+
+Every permutation has a fixed seed printed in the test source, making failures exactly replayable.
+
 For multi-process memory comparisons, use `cgroup_peak_mib` from `benchmark_branch_plans.py` as the
 primary whole-container measurement. Aggregate RSS remains in the output for continuity but counts
 fork-shared pages once per process.
