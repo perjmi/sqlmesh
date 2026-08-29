@@ -13,6 +13,24 @@ from sqlmesh.utils.dag import DAG
 from sqlmesh.utils.errors import SQLMeshError
 
 
+def _serialize_snapshot(snapshot: Snapshot) -> bytes:
+    """Serialize a snapshot without dropping its transient interval state."""
+    return pickle.dumps(
+        (snapshot, snapshot.intervals, snapshot.dev_intervals),
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+
+
+def deserialize_snapshot(payload: bytes) -> Snapshot:
+    value = pickle.loads(payload)
+    if isinstance(value, tuple) and len(value) == 3 and isinstance(value[0], Snapshot):
+        snapshot, intervals, dev_intervals = value
+        snapshot.intervals = intervals
+        snapshot.dev_intervals = dev_intervals
+        return t.cast(Snapshot, snapshot)
+    return t.cast(Snapshot, value)
+
+
 @dataclass(frozen=True)
 class SerializedSnapshot:
     """A worker-produced snapshot payload that can be inserted without coordinator hydration."""
@@ -29,7 +47,7 @@ class SerializedSnapshot:
             snapshot_id=snapshot.snapshot_id,
             parents=snapshot.parents,
             fingerprint=pickle.dumps(snapshot.fingerprint, protocol=pickle.HIGHEST_PROTOCOL),
-            payload=pickle.dumps(snapshot, protocol=pickle.HIGHEST_PROTOCOL),
+            payload=_serialize_snapshot(snapshot),
             is_new=is_new,
         )
 
@@ -45,7 +63,7 @@ class SerializedSnapshotUpdate:
     def from_snapshot(cls, snapshot: Snapshot) -> SerializedSnapshotUpdate:
         return cls(
             snapshot_id=snapshot.snapshot_id,
-            payload=pickle.dumps(snapshot, protocol=pickle.HIGHEST_PROTOCOL),
+            payload=_serialize_snapshot(snapshot),
         )
 
 
@@ -374,7 +392,7 @@ class SnapshotPlanStore:
         if pending_payload is not None and (
             not new_only or self.contains_snapshot(snapshot_id, new_only=True)
         ):
-            snapshot = t.cast(Snapshot, pickle.loads(pending_payload))
+            snapshot = deserialize_snapshot(pending_payload)
             self._cache_snapshot(snapshot)
             return snapshot
 
@@ -387,7 +405,7 @@ class SnapshotPlanStore:
         if row is None:
             raise KeyError(snapshot_id)
 
-        snapshot = t.cast(Snapshot, pickle.loads(row["payload"]))
+        snapshot = deserialize_snapshot(row["payload"])
         self._cache_snapshot(snapshot)
         return snapshot
 
@@ -526,9 +544,7 @@ class SnapshotPlanStore:
 
     def _persist_payload(self, snapshot: Snapshot) -> None:
         snapshot_id = snapshot.snapshot_id
-        self._pending_payloads[snapshot_id] = pickle.dumps(
-            snapshot, protocol=pickle.HIGHEST_PROTOCOL
-        )
+        self._pending_payloads[snapshot_id] = _serialize_snapshot(snapshot)
         self._pending_payloads.move_to_end(snapshot_id)
         if len(self._pending_payloads) >= self._write_batch_size:
             self._flush_pending_payloads()

@@ -352,10 +352,14 @@ class PlanBuilder:
             else DeployabilityIndex.all_deployable()
         )
 
+        indexed_earliest_interval_start = None
+        if isinstance(self._context_diff.snapshots, IndexedSnapshotMapping):
+            indexed_earliest_interval_start = self._earliest_interval_start()
+
         earliest_interval_start = (
             self._earliest_interval_start()
             if self._restate_models or self._forward_only_preview_needed
-            else yesterday_ds()
+            else indexed_earliest_interval_start or yesterday_ds()
         )
         restatements = self._build_restatements(dag, earliest_interval_start)
         models_to_backfill = self._build_models_to_backfill(dag, restatements)
@@ -403,6 +407,7 @@ class PlanBuilder:
             models_to_backfill=models_to_backfill,
             effective_from=self._effective_from,
             execution_time=plan_execution_time,
+            environment_start_at=indexed_earliest_interval_start,
             end_bounded=self._end_bounded,
             ensure_finalized_snapshots=self._ensure_finalized_snapshots,
             ignore_cron=self._ignore_cron,

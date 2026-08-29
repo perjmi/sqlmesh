@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import subprocess
@@ -129,14 +130,16 @@ def query(target: str, sql: str) -> tuple[str, ...]:
     return tuple(line for line in result.stdout.splitlines() if line)
 
 
-def database_signature(target: str, model_names: tuple[str, ...]) -> dict[str, object]:
+def database_signature(
+    target: str, model_names: tuple[str, ...], *, schema: str = "generated"
+) -> dict[str, object]:
     schemas = query(
         target,
-        """
+        f"""
         SELECT table_name, ordinal_position, column_name, data_type,
                COALESCE(numeric_precision::TEXT, ''), COALESCE(numeric_scale::TEXT, '')
         FROM information_schema.columns
-        WHERE table_schema = 'generated'
+        WHERE table_schema = '{schema}'
         ORDER BY table_name, ordinal_position
         """,
     )
@@ -167,6 +170,137 @@ def database_signature(target: str, model_names: tuple[str, ...]) -> dict[str, o
         "digests": digests,
         "materialized_view_count": materialized_view_count,
     }
+
+
+def model_names_for_environment(model_names: tuple[str, ...], environment: str) -> tuple[str, ...]:
+    return tuple(
+        model_name.replace("generated.", f"generated__{environment}.", 1)
+        for model_name in model_names
+    )
+
+
+def state_signature(target: str) -> dict[str, tuple[str, ...]]:
+    """Return deterministic planner state while excluding timestamps and generated row IDs."""
+    snapshots = _normalize_json_rows(
+        query(
+            target,
+            """
+            SELECT JSONB_BUILD_OBJECT(
+              'name', name,
+              'identifier', identifier,
+              'version', version,
+              'dev_version', dev_version,
+              'kind_name', kind_name,
+              'unrestorable', unrestorable,
+              'forward_only', forward_only,
+              'fingerprint', fingerprint::JSONB,
+              'change_category', snapshot::JSONB->'change_category',
+              'parents', COALESCE(snapshot::JSONB->'parents', '[]'::JSONB),
+              'previous_versions', COALESCE(
+                snapshot::JSONB->'previous_versions', '[]'::JSONB
+              ),
+              'dev_table_suffix', snapshot::JSONB->'dev_table_suffix',
+              'table_naming_convention', snapshot::JSONB->'table_naming_convention'
+            )::TEXT
+            FROM sqlmesh._snapshots
+            ORDER BY name, identifier
+            """,
+        )
+    )
+    intervals = query(
+        target,
+        """
+        SELECT name,
+               identifier,
+               version,
+               start_ts::TEXT,
+               end_ts::TEXT,
+               is_dev::TEXT,
+               is_removed::TEXT,
+               is_compacted::TEXT
+        FROM sqlmesh._intervals
+        ORDER BY name, identifier, version, start_ts, end_ts, is_dev, is_removed, is_compacted
+        """,
+    )
+    environments = _normalize_json_rows(
+        query(
+            target,
+            """
+            SELECT JSONB_BUILD_OBJECT(
+              'name', name,
+              'start_at', start_at,
+              'end_at', end_at,
+              'snapshots', snapshots::JSONB,
+              'promoted_snapshot_ids', promoted_snapshot_ids::JSONB,
+              'suffix_target', suffix_target,
+              'catalog_name_override', catalog_name_override,
+              'previous_finalized_snapshots', previous_finalized_snapshots::JSONB,
+              'normalize_name', normalize_name,
+              'requirements', requirements::JSONB
+            )::TEXT
+            FROM sqlmesh._environments
+            ORDER BY name
+            """,
+        )
+    )
+    return {
+        "snapshots": snapshots,
+        "intervals": intervals,
+        "environments": environments,
+    }
+
+
+def _normalize_json_rows(rows: tuple[str, ...]) -> tuple[str, ...]:
+    def _normalize(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _normalize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            normalized = [_normalize(item) for item in value]
+            if all(isinstance(item, dict) and "name" in item for item in normalized):
+                normalized.sort(
+                    key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
+                )
+            return normalized
+        return value
+
+    return tuple(
+        json.dumps(_normalize(json.loads(row)), sort_keys=True, separators=(",", ":"))
+        for row in rows
+    )
+
+
+def assert_state_equal() -> None:
+    """Compare normalized state with a compact first-difference diagnostic."""
+    reference = state_signature("reference")
+    candidate = state_signature("candidate")
+    assert candidate.keys() == reference.keys()
+    for section in reference:
+        candidate_rows = candidate[section]
+        reference_rows = reference[section]
+        assert len(candidate_rows) == len(reference_rows), (
+            f"{section} row count differs: "
+            f"candidate={len(candidate_rows)}, reference={len(reference_rows)}"
+        )
+        for row_index, (candidate_row, reference_row) in enumerate(
+            zip(candidate_rows, reference_rows)
+        ):
+            if candidate_row == reference_row:
+                continue
+            character_index = next(
+                (
+                    index
+                    for index, values in enumerate(zip(candidate_row, reference_row))
+                    if values[0] != values[1]
+                ),
+                min(len(candidate_row), len(reference_row)),
+            )
+            start = max(character_index - 100, 0)
+            end = character_index + 200
+            raise AssertionError(
+                f"{section}[{row_index}] differs at character {character_index}: "
+                f"candidate={candidate_row[start:end]!r}, "
+                f"reference={reference_row[start:end]!r}"
+            )
 
 
 def assert_model_rows_equal(model_names: tuple[str, ...]) -> None:

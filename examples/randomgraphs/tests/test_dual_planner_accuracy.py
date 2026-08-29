@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from accuracy_tiers import AccuracyScenario, selected_accuracy_scenarios
-from dual_planner import PROJECT_PATH, database_signature, plan, reset_database
+from dual_planner import PROJECT_PATH, assert_state_equal, database_signature, plan, reset_database
 from generate_model_graph import chunk_model_graph, generate_model_graph
 
 
@@ -14,9 +14,7 @@ from generate_model_graph import chunk_model_graph, generate_model_graph
     selected_accuracy_scenarios(),
     ids=lambda scenario: scenario.test_id,
 )
-def test_reference_and_candidate_are_equivalent(
-    scenario: AccuracyScenario, accuracy_stack
-) -> None:
+def test_reference_and_candidate_are_equivalent(scenario: AccuracyScenario, accuracy_stack) -> None:
     graph = generate_model_graph(
         scenario.width,
         output_dir=PROJECT_PATH / "models" / "generated",
@@ -36,6 +34,10 @@ def test_reference_and_candidate_are_equivalent(
     reference_signature = database_signature("reference", model_names)
     candidate_signature = database_signature("candidate", model_names)
     assert candidate_signature == reference_signature
+    if scenario.candidate_mode == "full":
+        assert_state_equal()
 
     assert "No changes to plan" in plan("reference")
     assert "No changes to plan" in plan("candidate")
+    if scenario.candidate_mode == "full":
+        assert_state_equal()

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import pickle
 import sqlite3
 import typing as t
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from sqlmesh.core.plan.store import SerializedSnapshotUpdate
+from sqlmesh.core.plan.store import SerializedSnapshotUpdate, deserialize_snapshot
 from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory, SnapshotId
 from sqlmesh.utils.date import TimeLike, to_datetime, to_timestamp
 from sqlmesh.utils.errors import SQLMeshError
@@ -140,4 +139,4 @@ def _load_snapshot(snapshot_id: SnapshotId) -> Snapshot:
     ).fetchone()
     if row is None:
         raise SQLMeshError(f"Snapshot '{snapshot_id}' was not found in the plan store")
-    return t.cast(Snapshot, pickle.loads(row["payload"]))
+    return deserialize_snapshot(row["payload"])

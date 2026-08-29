@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dual_planner import (
     PROJECT_PATH,
+    assert_state_equal,
     database_signature,
     plan,
     plan_result,
@@ -54,6 +55,7 @@ def test_randomized_baseline_and_environment_options_preserve_parity(accuracy_st
     assert database_signature("candidate", model_names) == database_signature(
         "reference", model_names
     )
+    assert_state_equal()
 
     environment_options = (
         ("--create-from", "prod"),
@@ -89,6 +91,7 @@ def test_randomized_baseline_and_environment_options_preserve_parity(accuracy_st
         option_groups=environment_options,
         permutation_seed=7303,
     )
+    assert_state_equal()
 
 
 def test_randomized_non_backfill_run_and_categorization_options_preserve_parity(
@@ -117,6 +120,7 @@ def test_randomized_non_backfill_run_and_categorization_options_preserve_parity(
     assert database_signature("candidate", model_names) == database_signature(
         "reference", model_names
     )
+    assert_state_equal()
 
     mutation = next(
         mutation
@@ -144,6 +148,7 @@ def test_randomized_non_backfill_run_and_categorization_options_preserve_parity(
         option_groups=dry_run_options,
         permutation_seed=8303,
     )
+    assert_state_equal()
 
     empty_backfill_options = (
         ("--create-from", "prod"),
@@ -167,6 +172,7 @@ def test_randomized_non_backfill_run_and_categorization_options_preserve_parity(
     assert database_signature("candidate", model_names) == database_signature(
         "reference", model_names
     )
+    assert_state_equal()
 
     uncategorized_options = (
         ("--no-auto-categorization",),
@@ -184,6 +190,7 @@ def test_randomized_non_backfill_run_and_categorization_options_preserve_parity(
     assert database_signature("candidate", model_names) == database_signature(
         "reference", model_names
     )
+    assert_state_equal()
 
 
 def test_randomized_restate_backfill_and_forward_only_options_preserve_parity(
@@ -216,6 +223,7 @@ def test_randomized_restate_backfill_and_forward_only_options_preserve_parity(
     assert database_signature("candidate", model_names) == database_signature(
         "reference", model_names
     )
+    assert_state_equal()
 
     mutation = next(
         mutation
@@ -248,6 +256,7 @@ def test_randomized_restate_backfill_and_forward_only_options_preserve_parity(
     )
     assert "No changes to plan" not in reference_preview
     assert "No changes to plan" not in candidate_preview
+    assert_state_equal()
 
     forward_only_options = (
         ("--forward-only",),
@@ -265,3 +274,4 @@ def test_randomized_restate_backfill_and_forward_only_options_preserve_parity(
     assert database_signature("candidate", model_names) == database_signature(
         "reference", model_names
     )
+    assert_state_equal()

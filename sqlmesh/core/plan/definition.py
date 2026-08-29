@@ -80,6 +80,7 @@ class Plan(PydanticModel, frozen=True):
     """All models that should be backfilled as part of this plan."""
     effective_from: t.Optional[TimeLike] = None
     execution_time_: t.Optional[TimeLike] = Field(default=None, alias="execution_time")
+    environment_start_at_: t.Optional[TimeLike] = Field(default=None, alias="environment_start_at")
 
     user_provided_flags: t.Optional[t.Dict[str, UserProvidedFlags]] = None
     selected_models: t.Optional[t.Set[str]] = None
@@ -245,7 +246,9 @@ class Plan(PydanticModel, frozen=True):
 
         return Environment(
             snapshots=snapshots,
-            start_at=self.provided_start or self._earliest_interval_start,
+            start_at=(
+                self.provided_start or self.environment_start_at_ or self._earliest_interval_start
+            ),
             end_at=self.provided_end,
             plan_id=self.plan_id,
             previous_plan_id=self.previous_plan_id,

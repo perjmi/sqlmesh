@@ -7,6 +7,7 @@ import pytest
 from accuracy_tiers import MutationScenario, selected_mutation_scenarios
 from dual_planner import (
     assert_model_rows_equal,
+    assert_state_equal,
     audit,
     database_signature,
     plan,
@@ -47,6 +48,7 @@ def test_random_model_mutations_preserve_planner_and_audit_parity(
         "reference", model_names
     )
     assert_model_rows_equal(materialized_view_names)
+    assert_state_equal()
 
     for mutation in (
         mutation for mutation in mutations if mutation.kind not in predeployment_kinds
@@ -60,6 +62,7 @@ def test_random_model_mutations_preserve_planner_and_audit_parity(
             "reference", model_names
         ), mutation
         assert_model_rows_equal(materialized_view_names)
+        assert_state_equal()
 
     audit_model = audit_mutation.model_name
     reference_pass = audit("reference", audit_model)
@@ -96,3 +99,4 @@ def test_random_model_mutations_preserve_planner_and_audit_parity(
 
     assert "No changes to plan" in plan("reference")
     assert "No changes to plan" in plan("candidate")
+    assert_state_equal()

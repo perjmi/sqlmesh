@@ -67,6 +67,8 @@ def test_snapshot_plan_store_accepts_worker_serialized_updates(tmp_path, make_sn
 
     worker_snapshot = snapshot.copy(deep=True)
     worker_snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    worker_snapshot.intervals = [(100, 200)]
+    worker_snapshot.dev_intervals = [(300, 400)]
     store.save_serialized_snapshot_updates(
         (SerializedSnapshotUpdate.from_snapshot(worker_snapshot),)
     )
@@ -74,6 +76,8 @@ def test_snapshot_plan_store_accepts_worker_serialized_updates(tmp_path, make_sn
     restored = store.snapshots[snapshot.snapshot_id]
     assert not cached_snapshot.categorized
     assert restored.change_category == SnapshotChangeCategory.BREAKING
+    assert restored.intervals == [(100, 200)]
+    assert restored.dev_intervals == [(300, 400)]
     assert store.get_fingerprint(snapshot.snapshot_id) == original_fingerprint
     assert store.parents(snapshot.snapshot_id) == original_parents
     assert snapshot.snapshot_id in store.new_snapshots

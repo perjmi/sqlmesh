@@ -129,6 +129,29 @@ pytest -q -o addopts='' -p no:cacheprovider tests/test_dual_planner_options.py
 
 Every permutation has a fixed seed printed in the test source, making failures exactly replayable.
 
+The extended parity suites compare normalized SQLMesh state as well as physical data. The state
+oracle covers snapshot fingerprints, versions, categories and parentage; logical intervals; and
+active environment membership and promotion metadata, while excluding generated IDs and wall-clock
+timestamps. Additional scenarios exercise real incremental-by-time-range runs and restatements,
+skip/empty/normal backfills, forward-only additive and destructive policies, development previews,
+selector expansion, deep/diamond/fan-in/disconnected DAGs, model add/rename/remove lifecycle, invalid
+dependencies and cycles, blocking-audit recovery, and simultaneous mutations:
+
+```bash
+REFERENCE_SQLMESH_IMAGE=randomgraphs-sqlmesh-main:latest \
+CANDIDATE_SQLMESH_IMAGE=randomgraphs-sqlmesh-streaming-iterator:latest \
+CANDIDATE_PLANNER_MODE=streaming \
+pytest -q -o addopts='' -p no:cacheprovider \
+  tests/test_dual_planner_semantics.py \
+  tests/test_dual_planner_lifecycle.py \
+  tests/test_dual_planner_failure_recovery.py
+```
+
+`test_dual_planner_batch_matrix.py` repeats baseline, mutation, and no-change parity checks with
+single-entry batches/caches and with uneven batch widths across two frequently recycled workers.
+The compose harness accepts `MODEL_BATCH_SIZE`, `SNAPSHOT_BATCH_SIZE`,
+`HYDRATED_MODEL_CACHE_SIZE`, and `HYDRATED_SNAPSHOT_CACHE_SIZE` in addition to the worker settings.
+
 For multi-process memory comparisons, use `cgroup_peak_mib` from `benchmark_branch_plans.py` as the
 primary whole-container measurement. Aggregate RSS remains in the output for continuity but counts
 fork-shared pages once per process.
