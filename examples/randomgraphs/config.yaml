@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+
+gateways:
+  postgres:
+    connection:
+      type: postgres
+      host: {{ env_var('POSTGRES_HOST', 'localhost') }}
+      port: {{ env_var('POSTGRES_PORT', '5432') }}
+      user: {{ env_var('POSTGRES_USER', 'postgres') }}
+      password: {{ env_var('POSTGRES_PASSWORD', 'postgres') }}
+      database: {{ env_var('POSTGRES_DB', 'sqlmesh') }}
+      check_import: false
+default_gateway: postgres
+cache_dir: {{ env_var('SQLMESH_CACHE_DIR', '.cache') }}
+model_defaults:
+  dialect: postgres

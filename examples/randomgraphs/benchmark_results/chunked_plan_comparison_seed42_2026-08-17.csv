@@ -1,0 +1,4 @@
+width,models,models_per_chunk,full_elapsed_seconds,full_peak_memory_mib,chunked_elapsed_seconds,chunked_peak_memory_mib,time_ratio_chunked_to_full,memory_ratio_chunked_to_full
+100,700,70,65.172723,1093.1914062,308.301152,1089.3828125,4.730524,0.996516
+200,1400,140,116.283372,1094.3671875,431.117071,3768.9335938,3.707470,3.443939
+300,2100,210,167.378834,2184.1132812,584.415559,2172.1328125,3.491574,0.994515

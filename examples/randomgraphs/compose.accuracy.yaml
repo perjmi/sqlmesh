@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+
+services:
+  reference_db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: sqlmesh
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sqlmesh"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  candidate_db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: sqlmesh
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sqlmesh"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  reference:
+    image: ${REFERENCE_SQLMESH_IMAGE:-randomgraphs-sqlmesh}
+    working_dir: /workspace/examples/randomgraphs
+    entrypoint: ["python", "/workspace/examples/randomgraphs/planner_entrypoint.py"]
+    environment:
+      POSTGRES_HOST: reference_db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: sqlmesh
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      SQLMESH_CACHE_DIR: /tmp/sqlmesh-cache
+      PYTHONDONTWRITEBYTECODE: 1
+      RANDOMGRAPHS_PLANNER_MODE: ${REFERENCE_PLANNER_MODE:-default}
+    depends_on:
+      reference_db:
+        condition: service_healthy
+    volumes:
+      - .:/workspace/examples/randomgraphs:ro
+    tmpfs:
+      - /tmp
+
+  candidate:
+    image: ${CANDIDATE_SQLMESH_IMAGE:-randomgraphs-sqlmesh}
+    working_dir: /workspace/examples/randomgraphs
+    entrypoint: ["python", "/workspace/examples/randomgraphs/planner_entrypoint.py"]
+    environment:
+      POSTGRES_HOST: candidate_db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: sqlmesh
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      SQLMESH_CACHE_DIR: /tmp/sqlmesh-cache
+      PYTHONDONTWRITEBYTECODE: 1
+      RANDOMGRAPHS_PLANNER_MODE: ${CANDIDATE_PLANNER_MODE:-default}
+      RANDOMGRAPHS_MODEL_BATCH_SIZE: ${MODEL_BATCH_SIZE:-100}
+      RANDOMGRAPHS_SNAPSHOT_BATCH_SIZE: ${SNAPSHOT_BATCH_SIZE:-10}
+      RANDOMGRAPHS_HYDRATED_MODEL_CACHE_SIZE: ${HYDRATED_MODEL_CACHE_SIZE:-250}
+      RANDOMGRAPHS_HYDRATED_SNAPSHOT_CACHE_SIZE: ${HYDRATED_SNAPSHOT_CACHE_SIZE:-250}
+      RANDOMGRAPHS_STREAMING_WORKERS: ${STREAMING_WORKERS:-2}
+      RANDOMGRAPHS_STREAMING_WORKER_MAX_TASKS: ${STREAMING_WORKER_MAX_TASKS:-25}
+      MAX_FORK_WORKERS: ${STREAMING_WORKERS:-2}
+    depends_on:
+      candidate_db:
+        condition: service_healthy
+    volumes:
+      - .:/workspace/examples/randomgraphs:ro
+    tmpfs:
+      - /tmp
