@@ -2,13 +2,40 @@
 
 # Personal regression tests
 
-`personal-tests` is a permanent test branch in `perjmi/sqlmesh`. It starts from
+`personal-tests` is a permanent test branch in the private GitLab repository
+[`statpej/sqlmesh`](https://gitlab.devops.prdroot.net/statpej/sqlmesh). It starts from
 `main` and carries the reusable `examples/randomgraphs/` harness copied from
 `streaming` at `bf0b604eb354a40da48dead1768173e55a323e52`.
 Tests that import streaming-only internals remain on `streaming` alongside that
 implementation. This branch changes no SQLMesh production code.
 
+The GitLab repository was imported from
+[`perjmi/sqlmesh`](https://github.com/perjmi/sqlmesh), preserving all 237 branches
+and 534 tags present at import. The GitHub fork remains available for upstream
+pull requests as `perjmi`.
+
 ## Branch workflow
+
+This checkout uses three remotes:
+
+| Remote | Repository | Purpose |
+| --- | --- | --- |
+| `origin` | `https://gitlab.devops.prdroot.net/statpej/sqlmesh.git` | Everyday development and personal tests |
+| `github` | `https://github.com/perjmi/sqlmesh` | Branches for GitHub pull requests |
+| `upstream` | `https://github.com/SQLMesh/sqlmesh.git` | Upstream source |
+
+The default push remote is `origin`. GitHub contributions use an explicit push to
+`github`; there is no automatic mirroring between the two copies. Authentication
+for each host is configured separately.
+
+GitLab's inherited push rule requires the author email to belong to a project
+member. This checkout uses the account's registered GitLab email for everyday
+commits. A local Git `includeIf` rule selects
+`Per Jensen <18235555+perjmi@users.noreply.github.com>` on `contribution/*` branches
+so GitHub attributes those commits to `perjmi`. Keep those branches on GitHub.
+This identity configuration lives in `.git/config` and
+`.git/github-contribution-identity.gitconfig`; it must be set up again in another
+checkout.
 
 Keep `main` aligned with `upstream/main`. Extend the reusable harness on
 `personal-tests`, commit it, and push to `origin/personal-tests`.
@@ -33,8 +60,21 @@ git switch -c work/my-change personal-tests
 
 For a contribution intended for upstream, start its branch from `upstream/main`
 and cherry-pick only the production fix and appropriate upstream tests from your
-work branch. Keep the harness commits on the personal branch. Avoid rebasing or
-force-pushing this shared, permanent branch.
+work branch:
+
+```bash
+git fetch upstream
+git switch -c contribution/my-change upstream/main
+git cherry-pick --no-commit FIX_COMMIT
+git commit -s -C FIX_COMMIT --reset-author
+git push -u github contribution/my-change
+```
+
+Replace `FIX_COMMIT` with your own relevant fix commit. Applying it without an
+automatic commit and then committing with `--reset-author` uses the GitHub
+identity selected for this branch. Open a GitHub pull request from
+`perjmi/sqlmesh` to `SQLMesh/sqlmesh`. Keep the harness commits on the personal
+branch. Avoid rebasing or force-pushing this shared, permanent branch.
 
 ## Fast local checks
 
