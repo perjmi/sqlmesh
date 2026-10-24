@@ -56,6 +56,9 @@ personal harness from upstream's bare pytest commands; that harness runs in its
 own required job with separate images and fixtures. Browser jobs retain
 Playwright reports and failure traces, and engine jobs retain Compose logs.
 Migration jobs restore the candidate checkout on failure as well as success.
+The mypy wrapper likewise limits upstream's strict type checks to its original
+tree; Ruff and formatting still cover the personal harness. Its standalone
+imports and historical benchmark scripts use a separate testing environment.
 
 The project uses merged-result pipelines: GitLab tests a temporary merge of the
 source and target branches. A successful pipeline is required before merging.
