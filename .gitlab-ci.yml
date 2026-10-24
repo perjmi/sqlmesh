@@ -17,7 +17,10 @@ personal-regressions:
   services:
     - name: mirror.gcr.io/library/docker:27.5.1-dind
       alias: docker
-      command: ["--tls=false", "--registry-mirror=https://mirror.gcr.io"]
+      command:
+        - --tls=false
+        - --registry-mirror=https://mirror.gcr.io
+        - --dns=10.96.5.5
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""

@@ -50,6 +50,11 @@ checkout at the same absolute path, which makes Compose bind mounts work.
 PostgreSQL, MySQL, and DuckDB test resources are isolated within the job's daemon
 and cleaned up after testing.
 
+The job's Docker daemon explicitly uses the cluster DNS server `10.96.5.5`.
+Docker's embedded resolver in the service container does not propagate to
+nested build containers; the explicit server keeps image builds and test
+containers able to resolve package indexes and other external hosts.
+
 ## Testing a GitHub contribution after rebase
 
 Fetch the pull request branch from `github` and rebase it onto a freshly fetched
