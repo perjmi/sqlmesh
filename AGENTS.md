@@ -64,6 +64,8 @@ migration, documentation, frontend, VS Code, and DCO checks. Keep the Makefile
 and existing fixtures as the test sources. Changes to GitLab CI run all portable
 suites; normal merge requests use affected-path rules, and manual/scheduled
 pipelines run everything. `UPSTREAM_TEST_ALL=1` forces every portable suite.
+Spark and Trino are manual while the cluster blocks their `cgr.dev` image source;
+`UPSTREAM_TEST_NETWORK_ENGINES=1` enables both as required checks.
 Dependency images are cached in the project registry; each job installs the
 exact checkout before testing. Do not forward registry credentials to test
 controllers. The Docker network shared with each upstream controller belongs to
