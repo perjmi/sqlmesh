@@ -1,6 +1,9 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 set -eu
+# The original upstream tree has no personal harness. It has its own required
+# job, dependencies, image builds, and fixtures, and must not enter this suite.
+set -- "$@" --ignore=examples/randomgraphs
 # Upstream's Makefile gives only the main process a JUnit path. Preserve it and
 # also report each isolated pytest invocation without overwriting earlier suites.
 for arg in "$@"; do

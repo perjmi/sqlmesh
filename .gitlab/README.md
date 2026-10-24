@@ -34,6 +34,7 @@ coverage for GitLab configuration and shared frontend dependency files. Changes
 to GitLab CI run every portable suite. Manual and scheduled pipelines run all
 portable suites; `UPSTREAM_TEST_ALL=1` also forces them for an individual pipeline.
 All selected jobs are required and run alongside `personal-regressions`.
+New commits cancel superseded interruptible pipelines, as upstream does.
 
 A complete merge-request pipeline has 33 jobs. Windows checks need a Windows
 runner and are outside this Linux cluster. Upstream's cloud-engine checks run
@@ -50,7 +51,9 @@ baked into these shared images.
 
 Jobs publish JUnit files and candidate/image revisions under `test-results/`.
 The pytest wrapper also gives each isolated test process its own JUnit report;
-the main upstream reports retain their original filenames. Browser jobs retain
+the main upstream reports retain their original filenames. It excludes the
+personal harness from upstream's bare pytest commands; that harness runs in its
+own required job with separate images and fixtures. Browser jobs retain
 Playwright reports and failure traces, and engine jobs retain Compose logs.
 Migration jobs restore the candidate checkout on failure as well as success.
 
