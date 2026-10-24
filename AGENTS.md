@@ -70,6 +70,8 @@ The Compose wrapper substitutes these image sources without editing upstream
 fixtures, preserving their project names, paths, and test commands.
 Spark's generated build recipe and Ivy settings use Maven Central's reachable
 endpoint while retaining upstream dependency versions.
+Keep Trino and Nessie memory bounds in the resolved Compose configuration;
+automatic JVM heap sizing can otherwise use the Kubernetes node's RAM.
 Dependency images are cached in the project registry; each job installs the
 exact checkout before testing. Do not forward registry credentials to test
 controllers. The Docker network shared with each upstream controller belongs to

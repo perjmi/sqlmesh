@@ -25,6 +25,13 @@ def main() -> None:
         image = os.environ["UPSTREAM_MINIO_IMAGE"]
         config["services"]["minio"]["image"] = image
         config["services"]["mc-job"]["image"] = image
+        if engine == "trino":
+            # Nested Docker must not size Trino's 80% initial heap from the
+            # Kubernetes node's RAM. Leave room for four Hive metastores and CI.
+            trino = config["services"]["trino"]
+            trino["mem_limit"] = "4g"
+            trino.setdefault("environment", {})["JDK_JAVA_OPTIONS"] = "-Xms1g -Xmx3g"
+            config["services"]["nessie"]["mem_limit"] = "1g"
         if engine == "spark":
             # Keep upstream's Spark base and JAR versions, using Maven Central's
             # reachable official endpoint for both image builds and Ivy resolution.
