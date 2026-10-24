@@ -64,6 +64,8 @@ the main upstream reports retain their original filenames. It excludes the
 personal harness from upstream's bare pytest commands; that harness runs in its
 own required job with separate images and fixtures. Browser jobs retain
 Playwright reports and failure traces, and engine jobs retain Compose logs.
+The code-server installer comes from its official GitHub release tag, since
+the cluster blocks `code-server.dev`; the installed version remains 4.137.0.
 Migration jobs restore the candidate checkout on failure as well as success.
 Python, DuckDB, and dbt jobs pin DuckDB 1.5.5 (1.4.4 on Python 3.9) and cache its matching `httpfs`,
 `tpch`, and `ducklake` binaries from PyPI wheels, because the cluster blocks

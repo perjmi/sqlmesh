@@ -104,7 +104,9 @@ case "$UPSTREAM_TEST_SUITE" in
             vscode) pnpm run ci ;;
             vscode-e2e)
                 make install-dev
-                curl -fsSL https://code-server.dev/install.sh | sh -s -- --version 4.137.0
+                curl -fsSL --retry 3 \
+                    https://raw.githubusercontent.com/coder/code-server/v4.137.0/install.sh \
+                    | sh -s -- --version 4.137.0
                 cd vscode/extension
                 PLAYWRIGHT_JUNIT_OUTPUT_FILE="$report_dir/junit-vscode-e2e.xml" \
                     pnpm run test:e2e --reporter=line,junit,html
