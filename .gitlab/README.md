@@ -34,15 +34,16 @@ project runner, stores its authentication token in a Kubernetes Secret, applies
 requirements. It reuses an existing runner and Secret on subsequent runs. Do
 not commit runner tokens or print Secret contents.
 
-The manager uses the existing workspace service account, which can manage pods
-within this namespace. Job pods use `sqlmesh-personal-tests` with no mounted
-Kubernetes API token. Each job receives its own Docker-in-Docker sidecar and
-ephemeral Docker storage; only that sidecar runs privileged. No Kubernetes node
-Docker socket is mounted. The Docker sidecar receives up to 8 CPUs and 16 GiB
+The runner uses GitLab's Docker executor inside a Kubernetes pod. Its Docker
+sidecar hosts job containers and each job's separate Docker-in-Docker service.
+The pod uses `sqlmesh-personal-tests` with no mounted Kubernetes API token and
+needs no pod-attach or exec permissions. Only the Docker daemons run privileged;
+build and helper containers remain unprivileged. No Kubernetes node Docker
+socket is mounted. The outer Docker sidecar receives up to 8 CPUs and 16 GiB
 of memory for image builds and all test databases. The runner executes one job
-at a time.
+at a time, and job Docker storage is removed with its service container.
 
-The runner shares the `/builds` volume across its containers. The job builds
+The Docker executor shares the `/builds` volume across job containers. The job builds
 reference and candidate SQLMesh images, then runs pytest in a controller image
 with the candidate installed. The controller mounts the job's Docker socket and
 checkout at the same absolute path, which makes Compose bind mounts work.

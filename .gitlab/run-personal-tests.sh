@@ -60,7 +60,7 @@ docker build --build-arg PYTHON_IMAGE=mirror.gcr.io/library/python:3.11-slim \
 docker build --build-arg "CANDIDATE_SQLMESH_IMAGE=$CANDIDATE_SQLMESH_IMAGE" \
     -f .gitlab/Dockerfile.personal-tests -t "$controller_image" .
 
-# The runner mounts /builds into the build and DinD containers. Keep the same
+# The Docker executor mounts /builds into the build and DinD containers. Keep the same
 # absolute path in the controller so Compose bind mounts see the harness files.
 # Only the test controller receives the per-job Docker socket, not cluster API
 # credentials or a socket from a Kubernetes node.

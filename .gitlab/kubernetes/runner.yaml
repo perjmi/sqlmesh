@@ -21,38 +21,22 @@ data:
       name = "sqlmesh-personal-k8s"
       url = "https://gitlab.devops.prdroot.net"
       token = "__RUNNER_TOKEN__"
-      executor = "kubernetes"
+      executor = "docker"
       builds_dir = "/builds"
       output_limit = 16384
-      [runners.kubernetes]
-        namespace = "ws-tryg360-next-development"
-        service_account = "sqlmesh-personal-tests"
-        automount_service_account_token = false
+      environment = ["FF_NETWORK_PER_BUILD=true"]
+      [runners.docker]
+        host = "tcp://localhost:2375"
+        tls_verify = false
         image = "mirror.gcr.io/library/docker:27.5.1-cli"
         privileged = false
+        services_privileged = true
+        allowed_privileged_services = ["mirror.gcr.io/library/docker:27.5.1-dind"]
         allowed_images = ["mirror.gcr.io/library/docker:27.5.1-cli"]
         allowed_services = ["mirror.gcr.io/library/docker:27.5.1-dind"]
-        poll_timeout = 600
-        cpu_request = "200m"
-        cpu_limit = "2"
-        memory_request = "256Mi"
-        memory_limit = "1Gi"
-        helper_cpu_request = "100m"
-        helper_cpu_limit = "1"
-        helper_memory_request = "128Mi"
-        helper_memory_limit = "512Mi"
-        service_cpu_request = "2"
-        service_cpu_limit = "8"
-        service_memory_request = "4Gi"
-        service_memory_limit = "16Gi"
-        service_ephemeral_storage_request = "2Gi"
-        service_ephemeral_storage_limit = "40Gi"
-        [runners.kubernetes.service_container_security_context]
-          privileged = true
-        [[runners.kubernetes.volumes.empty_dir]]
-          name = "docker-storage"
-          mount_path = "/var/lib/docker"
-          size_limit = "40Gi"
+        pull_policy = "if-not-present"
+        wait_for_services_timeout = 120
+        volumes = ["/builds"]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -69,9 +53,9 @@ spec:
       labels:
         app: sqlmesh-personal-runner
     spec:
-      # The workspace account already has namespaced pod management permissions.
-      # Test job pods use the separate account above with no mounted API token.
-      serviceAccountName: ws-tryg360-next-development
+      # Runner jobs use Docker inside this pod and need no Kubernetes API access.
+      serviceAccountName: sqlmesh-personal-tests
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 60
       containers:
         - name: runner
@@ -83,6 +67,12 @@ spec:
               mkdir -p /runner-config
               awk 'BEGIN {getline token < "/runner-secret/token"} {gsub(/__RUNNER_TOKEN__/, token); print}' \
                 /runner-template/config.toml > /runner-config/config.toml
+              attempts=0
+              until wget -q -O - http://localhost:2375/_ping >/dev/null; do
+                attempts=$((attempts + 1))
+                [ "$attempts" -lt 120 ] || exit 1
+                sleep 1
+              done
               exec gitlab-runner run --config /runner-config/config.toml --working-directory /tmp
           resources:
             requests:
@@ -102,6 +92,26 @@ spec:
               readOnly: true
             - name: config
               mountPath: /runner-config
+        - name: docker
+          image: mirror.gcr.io/library/docker:27.5.1-dind
+          args: ["--tls=false", "--registry-mirror=https://mirror.gcr.io"]
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: ""
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+              ephemeral-storage: 40Gi
+          volumeMounts:
+            - name: docker-storage
+              mountPath: /var/lib/docker
       volumes:
         - name: template
           configMap:
@@ -111,3 +121,6 @@ spec:
             secretName: sqlmesh-personal-runner
         - name: config
           emptyDir: {}
+        - name: docker-storage
+          emptyDir:
+            sizeLimit: 40Gi
