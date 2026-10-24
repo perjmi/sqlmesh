@@ -32,22 +32,26 @@ Python checks run for framework, test, example, backend, dependency, or CI chang
 Frontend and DB2 jobs use affected-path rules matching upstream, with additional
 coverage for GitLab configuration and shared frontend dependency files. Changes
 to GitLab CI run every portable suite. Manual and scheduled pipelines run all
-portable suites; `UPSTREAM_TEST_ALL=1` also forces them for an individual pipeline.
+available suites; `UPSTREAM_TEST_ALL=1` also forces them for an individual pipeline.
 All automatic jobs are required and run alongside `personal-regressions`.
-The network-dependent Spark, Trino, and DB2 jobs are manual until their registries
-are reachable. Set `UPSTREAM_TEST_NETWORK_ENGINES=1` to include them as required
-checks; `UPSTREAM_TEST_ALL=1` also includes them as required checks.
+`UPSTREAM_TEST_ALL=1` forces all 33 merge-request checks, including Spark, Trino,
+and DB2.
 New commits cancel superseded interruptible pipelines, as upstream does.
 
-A complete merge-request pipeline has 30 automatic required jobs and three manual
-network-dependent jobs by default, or 33 required jobs with the override above.
+A complete merge-request pipeline has 33 automatic required jobs.
 Windows checks need a Windows
 runner and are outside this Linux cluster. Upstream's cloud-engine checks run
 only on `main`; they require separate test accounts and are not PR merge tests.
-Spark and Trino additionally need network access to `cgr.dev`, which supplies
-the upstream fixtures' pinned MinIO images; DB2 needs IBM's `icr.io` registry.
-Their initial validation failed at these firewall boundaries. Once enabled as
-required checks, infrastructure failures fail the pipeline just like test failures.
+The cluster blocks the upstream fixtures' `cgr.dev` and `icr.io` image sources.
+Spark and Trino instead use MinIO server `RELEASE.2025-09-07T16-13-09Z` and client
+`RELEASE.2025-08-13T08-35-41Z` from official GitHub releases, verified against the
+publisher's SHA-256 checksums and cached in the project registry. DB2 uses IBM's
+official `ibmcom/db2:11.5.8.0` Docker Hub image pinned by digest, so its version
+differs from upstream's floating community image. `.gitlab/prepare-engine-compose.py`
+resolves the original Compose files and substitutes only these images in an
+artifact copy. The Docker wrapper keeps existing Makefile and readiness commands
+working with that copy; upstream fixtures and tests remain unchanged.
+Infrastructure failures fail the pipeline just like test failures.
 
 The upstream controller uses the job's Docker socket and network so database
 ports are available on localhost, as on GitHub's runners. Dependency images are
@@ -66,6 +70,8 @@ own required job with separate images and fixtures. Browser jobs retain
 Playwright reports and failure traces, and engine jobs retain Compose logs.
 The code-server installer comes from its official GitHub release tag, since
 the cluster blocks `code-server.dev`; the installed version remains 4.137.0.
+VS Code end-to-end jobs use the repository's `.venv`, matching upstream fixtures
+that invoke `.venv/bin/sqlmesh` directly.
 Migration jobs restore the candidate checkout on failure as well as success.
 Python, DuckDB, and dbt jobs pin DuckDB 1.5.5 (1.4.4 on Python 3.9) and cache its matching `httpfs`,
 `tpch`, and `ducklake` binaries from PyPI wheels, because the cluster blocks

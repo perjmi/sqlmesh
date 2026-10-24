@@ -47,6 +47,10 @@ case "$UPSTREAM_TEST_SUITE" in
         ;;
     engine)
         make install-dev
+        if [[ "$ENGINE" == spark || "$ENGINE" == trino || "$ENGINE" == db2 ]]; then
+            export UPSTREAM_COMPOSE_FILE="$report_dir/compose-resolved.json"
+            python .gitlab/prepare-engine-compose.py
+        fi
         if [[ "$ENGINE" == duckdb ]]; then
             prepare_duckdb
         fi
@@ -103,6 +107,10 @@ case "$UPSTREAM_TEST_SUITE" in
                 ;;
             vscode) pnpm run ci ;;
             vscode-e2e)
+                # Upstream's browser fixtures invoke .venv/bin/sqlmesh directly.
+                uv venv .venv
+                source .venv/bin/activate
+                export PATH="$project_dir/.gitlab/bin:$PATH"
                 make install-dev
                 curl -fsSL --retry 3 \
                     https://raw.githubusercontent.com/coder/code-server/v4.137.0/install.sh \

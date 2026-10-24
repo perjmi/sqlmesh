@@ -63,6 +63,20 @@ if ! docker pull "$image"; then
     fi
 fi
 
+UPSTREAM_MINIO_IMAGE=
+if [ "$UPSTREAM_TEST_SUITE" = engine ] && { [ "$ENGINE" = spark ] || [ "$ENGINE" = trino ]; }; then
+    minio_key=$(sha256sum .gitlab/Dockerfile.minio | cut -c 1-20)
+    UPSTREAM_MINIO_IMAGE="${CI_REGISTRY_IMAGE:-sqlmesh}/ci-minio:$minio_key"
+    if ! docker pull "$UPSTREAM_MINIO_IMAGE"; then
+        cp .gitlab/Dockerfile.minio "$build_context/Dockerfile.minio"
+        docker build -f "$build_context/Dockerfile.minio" -t "$UPSTREAM_MINIO_IMAGE" "$build_context"
+        if [ -n "${CI_REGISTRY:-}" ]; then
+            docker push "$UPSTREAM_MINIO_IMAGE"
+        fi
+    fi
+fi
+export UPSTREAM_MINIO_IMAGE
+
 printf 'candidate_sha=%s\nmerge_request_event_type=%s\nsuite=%s\npython=%s\nengine=%s\ndbt=%s\nimage=%s\n' \
     "$(git rev-parse HEAD)" "${CI_MERGE_REQUEST_EVENT_TYPE:-branch}" \
     "$UPSTREAM_TEST_SUITE" "${PYTHON_VERSION:-3.12}" "${ENGINE:-}" "${DBT_VERSION:-}" \
@@ -76,7 +90,7 @@ cat "$report_dir/revisions.txt"
 docker run --rm --name "$controller_name" --network host --shm-size=1g \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$project_dir:$project_dir" -w "$project_dir" \
-    -e CI=true -e UPSTREAM_TEST_SUITE -e PYTHON_VERSION -e ENGINE -e DBT_VERSION \
+    -e CI=true -e UPSTREAM_TEST_SUITE -e PYTHON_VERSION -e ENGINE -e DBT_VERSION -e UPSTREAM_MINIO_IMAGE \
     -e DBT_SEND_ANONYMOUS_USAGE_STATS=false \
     -e PYTEST_XDIST_AUTO_NUM_WORKERS=2 -e SPARK_LOCAL_IP=127.0.0.1 \
     "$image" bash .gitlab/upstream-tests.sh

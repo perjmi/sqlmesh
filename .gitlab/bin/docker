@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+# Keep upstream Makefile/readiness commands intact while selecting the resolved
+# CI infrastructure. Compose config preserves project names and absolute paths.
+args=()
+for arg in "$@"; do
+    if [[ "${1:-}" == compose && -n "${UPSTREAM_COMPOSE_FILE:-}" \
+        && "$arg" == *"/compose.${ENGINE:-}.yaml" ]]; then
+        args+=("$UPSTREAM_COMPOSE_FILE")
+    else
+        args+=("$arg")
+    fi
+done
+exec /usr/local/bin/docker "${args[@]}"

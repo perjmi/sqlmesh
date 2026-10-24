@@ -63,9 +63,11 @@ required to merge. GitLab branch conventions remain in `PERSONAL_TESTS.md`.
 migration, documentation, frontend, VS Code, and DCO checks. Keep the Makefile
 and existing fixtures as the test sources. Changes to GitLab CI run all portable
 suites; normal merge requests use affected-path rules, and manual/scheduled
-pipelines run everything. `UPSTREAM_TEST_ALL=1` forces every portable suite.
-Spark, Trino, and DB2 are manual while the cluster blocks their `cgr.dev` and
-`icr.io` image sources; `UPSTREAM_TEST_NETWORK_ENGINES=1` enables them as required checks.
+pipelines run all available suites. `UPSTREAM_TEST_ALL=1` forces every available
+portable suite regardless of changed paths. Spark and Trino use checksum-verified
+official MinIO binaries from GitHub; DB2 uses IBM's pinned Docker Hub image.
+The Compose wrapper substitutes these image sources without editing upstream
+fixtures, preserving their project names, commands, and paths.
 Dependency images are cached in the project registry; each job installs the
 exact checkout before testing. Do not forward registry credentials to test
 controllers. The Docker network shared with each upstream controller belongs to
