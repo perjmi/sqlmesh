@@ -67,7 +67,9 @@ pipelines run all available suites. `UPSTREAM_TEST_ALL=1` forces every available
 portable suite regardless of changed paths. Spark and Trino use checksum-verified
 official MinIO binaries from GitHub; DB2 uses IBM's pinned Docker Hub image.
 The Compose wrapper substitutes these image sources without editing upstream
-fixtures, preserving their project names, commands, and paths.
+fixtures, preserving their project names, paths, and test commands.
+Spark's generated build recipe and Ivy settings use Maven Central's reachable
+endpoint while retaining upstream dependency versions.
 Dependency images are cached in the project registry; each job installs the
 exact checkout before testing. Do not forward registry credentials to test
 controllers. The Docker network shared with each upstream controller belongs to

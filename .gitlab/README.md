@@ -48,9 +48,13 @@ Spark and Trino instead use MinIO server `RELEASE.2025-09-07T16-13-09Z` and clie
 publisher's SHA-256 checksums and cached in the project registry. DB2 uses IBM's
 official `ibmcom/db2:11.5.8.0` Docker Hub image pinned by digest, so its version
 differs from upstream's floating community image. `.gitlab/prepare-engine-compose.py`
-resolves the original Compose files and substitutes only these images in an
+resolves the original Compose files and substitutes these distributions in an
 artifact copy. The Docker wrapper keeps existing Makefile and readiness commands
 working with that copy; upstream fixtures and tests remain unchanged.
+Spark's generated build recipe keeps the original base image and JAR versions,
+but downloads PostgreSQL, AWS, and Iceberg JARs from Maven Central's reachable
+`repo.maven.apache.org` endpoint. Its Ivy settings use the same endpoint to
+resolve the upstream Spark Connect package.
 Infrastructure failures fail the pipeline just like test failures.
 
 The upstream controller uses the job's Docker socket and network so database

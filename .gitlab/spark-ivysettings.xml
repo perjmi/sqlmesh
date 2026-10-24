@@ -1,0 +1,7 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<ivysettings>
+  <settings defaultResolver="central" />
+  <resolvers>
+    <ibiblio name="central" m2compatible="true" root="https://repo.maven.apache.org/maven2/" />
+  </resolvers>
+</ivysettings>
