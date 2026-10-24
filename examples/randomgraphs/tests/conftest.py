@@ -17,6 +17,11 @@ from generate_model_graph import generate_model_graph  # noqa: E402
 from randomgraph_mutations import write_randomgraph_audit  # noqa: E402
 
 
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    # Check noninteractive CLI options before the longer graph comparisons.
+    items.sort(key=lambda item: item.path.name != "test_dual_planner_options.py")
+
+
 @pytest.fixture(scope="session")
 def accuracy_stack() -> Iterator[None]:
     run(*COMPOSE, "up", "-d", "--wait", "reference_db", "candidate_db")
