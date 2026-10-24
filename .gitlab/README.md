@@ -55,9 +55,10 @@ Spark's generated build recipe keeps the original base image and JAR versions,
 but downloads PostgreSQL, AWS, and Iceberg JARs from Maven Central's reachable
 `repo.maven.apache.org` endpoint. Its Ivy settings use the same endpoint to
 resolve the upstream Spark Connect package.
-Trino receives a 4 GiB container limit and a 1–3 GiB JVM heap; Nessie receives
-1 GiB. These bounds prevent nested Docker from sizing heaps against the much
-larger Kubernetes node instead of the runner pod's 16 GiB limit.
+Trino receives an 8 GiB container limit, four CPUs, a 512 MiB–3 GiB JVM heap,
+and at most 1 GiB of direct memory. Its JVM also sees four processors to bound
+thread pools. Nessie receives 1 GiB. These bounds keep nested Docker within
+the runner pod's 16 GiB budget during Hive, Iceberg, Delta, and Nessie tests.
 Infrastructure failures fail the pipeline just like test failures.
 
 The upstream controller uses the job's Docker socket and network so database

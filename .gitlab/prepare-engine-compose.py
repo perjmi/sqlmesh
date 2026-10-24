@@ -29,8 +29,11 @@ def main() -> None:
             # Nested Docker must not size Trino's 80% initial heap from the
             # Kubernetes node's RAM. Leave room for four Hive metastores and CI.
             trino = config["services"]["trino"]
-            trino["mem_limit"] = "4g"
-            trino.setdefault("environment", {})["JDK_JAVA_OPTIONS"] = "-Xms1g -Xmx3g"
+            trino["mem_limit"] = "8g"
+            trino["cpus"] = 4.0
+            trino.setdefault("environment", {})["JDK_JAVA_OPTIONS"] = (
+                "-Xms512m -Xmx3g -XX:MaxDirectMemorySize=1g -XX:ActiveProcessorCount=4"
+            )
             config["services"]["nessie"]["mem_limit"] = "1g"
         if engine == "spark":
             # Keep upstream's Spark base and JAR versions, using Maven Central's
