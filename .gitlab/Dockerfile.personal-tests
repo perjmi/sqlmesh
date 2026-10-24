@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-ARG CANDIDATE_SQLMESH_IMAGE
+ARG CANDIDATE_SQLMESH_IMAGE=sqlmesh-candidate:latest
 FROM mirror.gcr.io/library/docker:27.5.1-cli AS docker_cli
 
 FROM ${CANDIDATE_SQLMESH_IMAGE}

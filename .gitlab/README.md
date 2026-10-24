@@ -45,7 +45,9 @@ at a time, and job Docker storage is removed with its service container.
 
 The Docker executor shares the `/builds` volume across job containers. The job builds
 reference and candidate SQLMesh images, then runs pytest in a controller image
-with the candidate installed. The controller mounts the job's Docker socket and
+with the candidate installed. Pytest runs from the harness directory so the raw
+checkout does not shadow the installed package and its generated version module.
+The controller mounts the job's Docker socket and
 checkout at the same absolute path, which makes Compose bind mounts work.
 PostgreSQL, MySQL, and DuckDB test resources are isolated within the job's daemon
 and cleaned up after testing.

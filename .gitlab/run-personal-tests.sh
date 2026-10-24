@@ -66,10 +66,10 @@ docker build --build-arg "CANDIDATE_SQLMESH_IMAGE=$CANDIDATE_SQLMESH_IMAGE" \
 # credentials or a socket from a Kubernetes node.
 docker run --rm --name "$controller_name" \
     -v /var/run/docker.sock:/var/run/docker.sock \
-    -v "$project_dir:$project_dir" -w "$project_dir" \
+    -v "$project_dir:$project_dir" -w "$project_dir/examples/randomgraphs" \
     -e REFERENCE_SQLMESH_IMAGE -e CANDIDATE_SQLMESH_IMAGE \
     -e "RANDOMGRAPHS_ACCURACY_TIER=${RANDOMGRAPHS_ACCURACY_TIER:-pr}" \
     -e "RANDOMGRAPHS_MUTATION_TIER=${RANDOMGRAPHS_MUTATION_TIER:-pr}" \
     -e PYTHONDONTWRITEBYTECODE=1 \
-    "$controller_image" python -m pytest -c examples/randomgraphs/pytest.ini \
-    examples/randomgraphs/tests --junitxml="$report_dir/junit.xml"
+    "$controller_image" python -m pytest -c pytest.ini \
+    tests --junitxml="$report_dir/junit.xml"
