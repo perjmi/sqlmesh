@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import typing as t
+from uuid import uuid4
 
-from sqlglot import exp
+from sqlglot import exp, parse_one
 
 from sqlmesh import CustomMaterialization, Model
 
@@ -34,17 +35,58 @@ class PostgresMaterializedView(CustomMaterialization):
             self.adapter.execute(f"REFRESH MATERIALIZED VIEW {table_name}")
             return
 
-        if existing:
-            self.adapter.drop_table(table_name)
-
-        self.adapter.execute(
-            exp.Create(
-                this=exp.to_table(table_name, dialect=self.adapter.dialect),
-                kind="VIEW",
-                expression=query_or_df,
-                properties=exp.Properties(expressions=[exp.MaterializedProperty()]),
-            )
+        table = exp.to_table(table_name, dialect=self.adapter.dialect)
+        create = exp.Create(
+            this=table,
+            kind="VIEW",
+            expression=query_or_df,
+            properties=exp.Properties(expressions=[exp.MaterializedProperty()]),
         )
+        if not existing:
+            self.adapter.execute(create)
+            return
+
+        # Skip/empty backfills create table placeholders and virtual views before
+        # insert is called. Replace the placeholder without losing those views.
+        backup = table.copy()
+        backup.set("this", exp.to_identifier(f"sqlmesh_backup_{uuid4().hex}"))
+        lookup_table = table.copy()
+        lookup_table.set("catalog", None)
+        relation = exp.Literal.string(lookup_table.sql(dialect=self.adapter.dialect)).sql(
+            dialect=self.adapter.dialect
+        )
+        with self.adapter.transaction():
+            dependent_views = self.adapter.fetchall(
+                f"""
+                SELECT DISTINCT namespace.nspname, view_object.relname,
+                                pg_get_viewdef(view_object.oid, true)
+                FROM pg_depend AS dependency
+                JOIN pg_rewrite AS rewrite ON rewrite.oid = dependency.objid
+                JOIN pg_class AS view_object ON view_object.oid = rewrite.ev_class
+                JOIN pg_namespace AS namespace ON namespace.oid = view_object.relnamespace
+                WHERE dependency.classid = 'pg_rewrite'::regclass
+                  AND dependency.refobjid = to_regclass({relation})
+                  AND view_object.relkind = 'v'
+                ORDER BY namespace.nspname, view_object.relname
+                """
+            )
+            self.adapter.rename_table(table, backup)
+            self.adapter.execute(create)
+            for schema, name, definition in dependent_views:
+                # PostgreSQL's adapter drops views when replacing them. Use
+                # CREATE OR REPLACE directly to retain downstream dependencies.
+                self.adapter.execute(
+                    exp.Create(
+                        this=exp.Table(
+                            this=exp.to_identifier(name, quoted=True),
+                            db=exp.to_identifier(schema, quoted=True),
+                        ),
+                        kind="VIEW",
+                        expression=parse_one(definition, dialect=self.adapter.dialect),
+                        replace=True,
+                    )
+                )
+            self.adapter.drop_table(backup)
 
     def delete(self, name: str, **kwargs: t.Any) -> None:
         cascade = kwargs.pop("cascade", False)

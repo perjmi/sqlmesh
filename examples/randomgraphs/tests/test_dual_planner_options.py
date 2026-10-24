@@ -6,11 +6,11 @@ from dual_planner import (
     PROJECT_PATH,
     assert_state_equal,
     database_signature,
+    model_names_for_environment,
     plan,
     plan_result,
     randomized_plan_options,
     reset_database,
-    state_signature,
 )
 from generate_model_graph import generate_model_graph
 from randomgraph_mutations import generate_model_mutations
@@ -180,33 +180,27 @@ def test_randomized_non_backfill_run_and_categorization_options_preserve_parity(
         ("--execution-time", "2026-09-13T00:00:00+00:00"),
         ("--diff-rendered",),
     )
-    before_states = {target: state_signature(target) for target in ("reference", "candidate")}
-    before_data = {
-        target: database_signature(target, model_names) for target in ("reference", "candidate")
-    }
     reference_result = plan_result(
         "reference", option_groups=uncategorized_options, permutation_seed=8305
     )
     candidate_result = plan_result(
         "candidate", option_groups=uncategorized_options, permutation_seed=8305
     )
-    # Disabling automatic categorization requires an explicit category choice,
-    # even with --no-prompts. With no stdin, both CLIs must abort before applying.
-    for target, result in (("reference", reference_result), ("candidate", candidate_result)):
+    # The development plans already categorized this snapshot. Disabling new
+    # automatic categorization must still allow its promotion to production.
+    for result in (reference_result, candidate_result):
         output = result.stdout + result.stderr
-        assert result.returncode != 0, output
-        assert "[Breaking]" in output, output
-        assert "Aborted!" in output, output
-        assert state_signature(target) == before_states[target]
-        assert database_signature(target, model_names) == before_data[target]
-
-    categorized_options = uncategorized_options[1:]
-    plan("reference", option_groups=categorized_options, permutation_seed=8306)
-    plan("candidate", option_groups=categorized_options, permutation_seed=8306)
+        assert result.returncode == 0, output
     assert database_signature("candidate", model_names) == database_signature(
         "reference", model_names
     )
     assert_state_equal()
+    for environment in ("random_options_dry", "random_options_empty"):
+        environment_models = model_names_for_environment(model_names, environment)
+        schema = f"generated__{environment}"
+        assert database_signature("candidate", environment_models, schema=schema) == (
+            database_signature("reference", environment_models, schema=schema)
+        )
 
 
 def test_randomized_restate_backfill_and_forward_only_options_preserve_parity(

@@ -19,9 +19,11 @@ the job fetches upstream `main` once and records the resolved SHA.
 
 The job streams each test result as it completes, runs CLI option checks first,
 and stops at the first failure. A successful run executes the full suite. The
-harness sets a historical model start date so its fixed execution-time scenarios remain valid on later CI
-runs. Aggregate comparisons sort complete records to account for PostgreSQL's
+harness sets a historical model start date so its fixed execution-time scenarios
+remain valid on later CI runs. Aggregate comparisons sort complete records to account for PostgreSQL's
 unordered `UNION ALL` output while still comparing every value.
+The custom PostgreSQL materialization converts empty backfill placeholders in a
+transaction while preserving dependent development views.
 
 ## Kubernetes runner
 
