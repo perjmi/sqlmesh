@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+FROM node:22-bookworm AS node
+FROM mcr.microsoft.com/playwright:v1.54.1-jammy
+
+# Match upstream's Node 22 and the browsers pinned by pnpm-lock.yaml.
+COPY --from=node /usr/local/ /usr/local/
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl default-jdk git libpq-dev netcat-traditional \
+    python3-pip sudo unixodbc-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN npm install --global pnpm@10 && pip3 install --no-cache-dir uv==0.12.22 \
+    && uv venv --python 3.12 /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV UV=1 UV_NO_PROGRESS=1 PYTHONUNBUFFERED=1

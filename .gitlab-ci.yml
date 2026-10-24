@@ -9,7 +9,10 @@ workflow:
 stages:
   - regression
 
-personal-regressions:
+include:
+  - local: .gitlab/upstream-pr-tests.yml
+
+.k8s-docker:
   stage: regression
   image: mirror.gcr.io/library/docker:27.5.1-cli
   tags:
@@ -26,10 +29,14 @@ personal-regressions:
     DOCKER_TLS_CERTDIR: ""
     HEALTHCHECK_TCP_PORT: "2375"
     GIT_DEPTH: "0"
-    RANDOMGRAPHS_ACCURACY_TIER: pr
-    RANDOMGRAPHS_MUTATION_TIER: pr
   timeout: 2h
   interruptible: true
+
+personal-regressions:
+  extends: .k8s-docker
+  variables:
+    RANDOMGRAPHS_ACCURACY_TIER: pr
+    RANDOMGRAPHS_MUTATION_TIER: pr
   script:
     - sh .gitlab/run-personal-tests.sh
   artifacts:

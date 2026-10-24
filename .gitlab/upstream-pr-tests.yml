@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: Apache-2.0
+# Linux equivalents of .github/workflows/pr.yaml and db2.yaml.
+
+.upstream-tests:
+  extends: .k8s-docker
+  script:
+    - sh .gitlab/run-upstream-tests.sh
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - test-results/
+    reports:
+      junit:
+        - test-results/*.xml
+        - test-results/upstream/*.xml
+
+.upstream-python:
+  extends: .upstream-tests
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $UPSTREAM_TEST_ALL == "1"'
+    - changes:
+        - sqlmesh/**/*
+        - sqlmesh_dbt/**/*
+        - tests/**/*
+        - examples/**/*
+        - web/server/**/*
+        - pytest.ini
+        - setup.cfg
+        - setup.py
+        - pyproject.toml
+        - .github/**/*
+        - .gitlab/**/*
+        - .gitlab-ci.yml
+        - Makefile
+        - .pre-commit-config.yaml
+
+upstream-python:
+  extends: .upstream-python
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+  variables:
+    UPSTREAM_TEST_SUITE: python
+
+upstream-documentation:
+  extends: .upstream-python
+  variables:
+    UPSTREAM_TEST_SUITE: documentation
+    PYTHON_VERSION: "3.10"
+
+upstream-migrations:
+  extends: .upstream-python
+  variables:
+    UPSTREAM_TEST_SUITE: migrations
+    PYTHON_VERSION: "3.10"
+
+upstream-engines:
+  extends: .upstream-python
+  parallel:
+    matrix:
+      - ENGINE: [duckdb, postgres, mysql, mssql, trino, spark, clickhouse, risingwave, starrocks]
+  variables:
+    UPSTREAM_TEST_SUITE: engine
+    PYTHON_VERSION: "3.12"
+
+upstream-dbt:
+  extends: .upstream-python
+  parallel:
+    matrix:
+      - DBT_VERSION: ["1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11", "1.12"]
+  variables:
+    UPSTREAM_TEST_SUITE: dbt
+    PYTHON_VERSION: "3.10"
+
+upstream-db2:
+  extends: .upstream-tests
+  variables:
+    UPSTREAM_TEST_SUITE: engine
+    PYTHON_VERSION: "3.12"
+    ENGINE: db2
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $UPSTREAM_TEST_ALL == "1"'
+    - changes:
+        - sqlmesh/core/engine_adapter/db2.py
+        - tests/core/engine_adapter/test_db2.py
+        - tests/core/engine_adapter/integration/test_integration_db2.py
+        - tests/core/engine_adapter/integration/docker/compose.db2.yaml
+        - .github/workflows/db2.yaml
+        - .gitlab/**/*
+        - .gitlab-ci.yml
+        - pyproject.toml
+
+.upstream-frontend:
+  extends: .upstream-tests
+  variables:
+    PYTHON_VERSION: "3.12"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - test-results/
+      - web/client/playwright-report/
+      - web/client/test-results/
+      - vscode/extension/playwright-report/
+      - vscode/extension/test-results/
+    reports:
+      junit: test-results/upstream/*.xml
+
+upstream-ui-style:
+  extends: .upstream-frontend
+  variables:
+    UPSTREAM_TEST_SUITE: ui-style
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $UPSTREAM_TEST_ALL == "1"'
+    - changes:
+        - web/client/**/*
+        - web/common/**/*
+        - vscode/**/*
+        - package.json
+        - pnpm-lock.yaml
+        - pnpm-workspace.yaml
+        - .github/**/*
+        - .gitlab/**/*
+        - .gitlab-ci.yml
+        - Makefile
+        - .pre-commit-config.yaml
+
+upstream-ui:
+  extends: .upstream-frontend
+  variables:
+    UPSTREAM_TEST_SUITE: ui
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $UPSTREAM_TEST_ALL == "1"'
+    - changes:
+        - web/client/**/*
+        - web/common/**/*
+        - package.json
+        - pnpm-lock.yaml
+        - pnpm-workspace.yaml
+        - .github/**/*
+        - .gitlab/**/*
+        - .gitlab-ci.yml
+        - Makefile
+        - .pre-commit-config.yaml
+
+upstream-vscode:
+  extends: .upstream-frontend
+  variables:
+    UPSTREAM_TEST_SUITE: vscode
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $UPSTREAM_TEST_ALL == "1"'
+    - changes:
+        - vscode/**/*
+        - web/common/**/*
+        - package.json
+        - pnpm-lock.yaml
+        - pnpm-workspace.yaml
+        - .github/**/*
+        - .gitlab/**/*
+        - .gitlab-ci.yml
+        - Makefile
+        - .pre-commit-config.yaml
+
+upstream-vscode-e2e:
+  extends: .upstream-frontend
+  variables:
+    UPSTREAM_TEST_SUITE: vscode-e2e
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $UPSTREAM_TEST_ALL == "1"'
+    - changes:
+        - vscode/**/*
+        - sqlmesh/lsp/**/*
+        - web/common/**/*
+        - package.json
+        - pnpm-lock.yaml
+        - pnpm-workspace.yaml
+        - .github/**/*
+        - .gitlab/**/*
+        - .gitlab-ci.yml
+        - Makefile
+        - .pre-commit-config.yaml
+
+upstream-dco:
+  extends: .k8s-docker
+  services: []
+  script:
+    - sh .gitlab/check-dco.sh
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'

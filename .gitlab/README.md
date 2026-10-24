@@ -1,12 +1,58 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Personal regression merge tests
+# Merge tests
 
 The root `.gitlab-ci.yml` runs the full `examples/randomgraphs/tests` suite for
 GitLab merge requests, pushes to `personal-tests`, and manual or scheduled
 pipelines. Merge requests should target `personal-tests`, and their source
 branches should include that branch's CI configuration and harness. GitHub
 upstream contributions continue to use the separate GitHub workflow.
+
+## Upstream PR checks
+
+`.gitlab/upstream-pr-tests.yml` adds the Linux checks from upstream's
+[PR workflow](https://github.com/SQLMesh/sqlmesh/blob/main/.github/workflows/pr.yaml)
+and [DB2 workflow](https://github.com/SQLMesh/sqlmesh/blob/main/.github/workflows/db2.yaml).
+It reuses the repository's Makefile, migration script, fixtures, and Compose
+files rather than maintaining a separate copy of the tests.
+
+| Jobs | Checks |
+| --- | --- |
+| `upstream-python` (Python 3.9–3.13) | `make py-style`, benchmarks except on 3.9, and all `make cicd-test` phases |
+| `upstream-documentation` (Python 3.10) | Development/doc dependencies and `make doc-test` |
+| `upstream-migrations` (Python 3.10) | Previous-release-to-candidate migrations for sushi and sushi_dbt |
+| `upstream-engines` (Python 3.12) | DuckDB, PostgreSQL, MySQL, MSSQL, Trino, Spark, ClickHouse, RisingWave, StarRocks |
+| `upstream-dbt` (Python 3.10, dbt 1.3–1.12) | Upstream dependency overrides, fast dbt tests, and `sqlmesh info` compatibility |
+| `upstream-db2` (Python 3.12) | DB2 adapter and integration tests |
+| `upstream-ui-style`, `upstream-ui` | Frontend lint, build, unit tests, and Chromium/Firefox/WebKit end-to-end tests |
+| `upstream-vscode`, `upstream-vscode-e2e` | Workspace CI and extension end-to-end tests with pinned code-server 4.137.0 |
+| `upstream-dco` | DCO sign-offs on contribution commits, excluding merge commits |
+
+Python checks run for framework, test, example, backend, dependency, or CI changes.
+Frontend and DB2 jobs use affected-path rules matching upstream, with additional
+coverage for GitLab configuration and shared frontend dependency files. Changes
+to GitLab CI run every portable suite. Manual and scheduled pipelines run all
+portable suites; `UPSTREAM_TEST_ALL=1` also forces them for an individual pipeline.
+All selected jobs are required and run alongside `personal-regressions`.
+
+A complete merge-request pipeline has 33 jobs. Windows checks need a Windows
+runner and are outside this Linux cluster. Upstream's cloud-engine checks run
+only on `main`; they require separate test accounts and are not PR merge tests.
+
+The upstream controller uses the job's Docker socket and network so database
+ports are available on localhost, as on GitHub's runners. Dependency images are
+cached in this project's GitLab container registry, keyed by the image recipe,
+Python version, and `pyproject.toml`. Each job installs its exact candidate
+checkout before testing. Registry login uses short-lived job credentials that
+are not passed to the controller. The build context contains only the image
+recipe and dependency manifest, so credentials and candidate source are not
+baked into these shared images.
+
+Jobs publish JUnit files and candidate/image revisions under `test-results/`.
+The pytest wrapper also gives each isolated test process its own JUnit report;
+the main upstream reports retain their original filenames. Browser jobs retain
+Playwright reports and failure traces, and engine jobs retain Compose logs.
+Migration jobs restore the candidate checkout on failure as well as success.
 
 The project uses merged-result pipelines: GitLab tests a temporary merge of the
 source and target branches. A successful pipeline is required before merging.
@@ -48,8 +94,11 @@ The pod uses `sqlmesh-personal-tests` with no mounted Kubernetes API token and
 needs no pod-attach or exec permissions. Only the Docker daemons run privileged;
 build and helper containers remain unprivileged. No Kubernetes node Docker
 socket is mounted. The outer Docker sidecar receives up to 8 CPUs and 16 GiB
-of memory for image builds and all test databases. The runner executes one job
-at a time, and job Docker storage is removed with its service container.
+of memory for image builds and all test databases. There are three runner pods,
+each executing one job at a time. Each pod requests 2 CPUs and 4 GiB for Docker;
+the three Docker sidecars together have limits of 24 CPUs and 48 GiB. Job Docker
+storage is removed with its service container. Fixed Compose names are safe
+across jobs because each job has its own daemon and checkout.
 
 The Docker executor shares the `/builds` volume across job containers. The job builds
 reference and candidate SQLMesh images, then runs pytest in a controller image

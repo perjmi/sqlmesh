@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+set -eu
+# Upstream's Makefile gives only the main process a JUnit path. Preserve it and
+# also report each isolated pytest invocation without overwriting earlier suites.
+for arg in "$@"; do
+    case "$arg" in
+        --junitxml|--junitxml=*|--junit-xml|--junit-xml=*) exec python -m pytest "$@" ;;
+    esac
+done
+exec python -m pytest "$@" "--junitxml=${PYTEST_REPORT_DIR:-test-results/upstream}/junit-$$.xml"

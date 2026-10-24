@@ -22,7 +22,7 @@ workflow and regression harness, and [CONTRIBUTING.md](CONTRIBUTING.md) and
 | `tests/` | Framework, engine, CLI, web, dbt, and integration tests |
 | `examples/`, `benchmarks/`, `docs/`, `tooling/` | Example projects, performance checks, documentation, and development tools |
 | `examples/randomgraphs/` | Personal regression and planner comparison harness |
-| `.gitlab/`, `.gitlab-ci.yml` | Kubernetes runner provisioning and personal regression merge tests |
+| `.gitlab/`, `.gitlab-ci.yml` | Kubernetes runner provisioning, upstream PR checks, and personal regression merge tests |
 
 ## GitHub and GitLab
 
@@ -52,12 +52,22 @@ GitHub configuration and integration code live in these locations:
   guide and its images.
 
 GitLab merge tests are configured in `.gitlab-ci.yml`; `.gitlab/` contains the
-runner manifest, provisioner, controller Dockerfile, and test script. Read
+runner manifest, provisioner, controller Dockerfiles, and test scripts. Read
 [.gitlab/README.md](.gitlab/README.md) for cluster operation. The runner uses tag
-`sqlmesh-personal-k8s` in namespace `ws-tryg360-next-development`, with one job at
-a time and a separate Docker daemon for each job. Merge requests target
+`sqlmesh-personal-k8s` in namespace `ws-tryg360-next-development`, with three runner
+pods, one job per pod, and a separate Docker daemon for each job. Merge requests target
 `personal-tests` and use merged-result pipelines; a successful pipeline is
 required to merge. GitLab branch conventions remain in `PERSONAL_TESTS.md`.
+
+`.gitlab/upstream-pr-tests.yml` translates upstream's Linux Python, engine, dbt,
+migration, documentation, frontend, VS Code, and DCO checks. Keep the Makefile
+and existing fixtures as the test sources. Changes to GitLab CI run all portable
+suites; normal merge requests use affected-path rules, and manual/scheduled
+pipelines run everything. `UPSTREAM_TEST_ALL=1` forces every portable suite.
+Dependency images are cached in the project registry; each job installs the
+exact checkout before testing. Do not forward registry credentials to test
+controllers. The Docker network shared with each upstream controller belongs to
+that job's isolated daemon, so Compose localhost ports cannot collide across jobs.
 
 Authenticated Git and API access to both hosts has been verified in this
 workspace. GitHub uses the `gh` CLI; `gh api user` checks the active account and

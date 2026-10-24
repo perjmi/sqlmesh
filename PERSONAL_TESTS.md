@@ -80,7 +80,9 @@ branch. Avoid rebasing or force-pushing this shared, permanent branch.
 
 GitLab merge requests targeting `personal-tests` also run the complete harness
 in the Kubernetes cluster through `.gitlab-ci.yml`. The project uses merged-result
-pipelines and requires a successful pipeline before merging. See
+pipelines and requires a successful pipeline before merging. It also runs the
+portable upstream PR checks, with full Python and dbt compatibility matrices
+and database integration suites selected by affected paths. See
 [.gitlab/README.md](.gitlab/README.md) for runner provisioning, reports, and testing
 rebased GitHub contributions. The default CI accuracy and mutation tiers are `pr`.
 

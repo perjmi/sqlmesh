@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+ARG PYTHON_VERSION=3.12
+FROM mirror.gcr.io/library/docker:27.5.1-cli AS docker_cli
+
+FROM python:${PYTHON_VERSION}-slim-bookworm
+COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker_cli /usr/local/libexec/docker/cli-plugins/ /usr/local/libexec/docker/cli-plugins/
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl default-jdk git libpq-dev netcat-traditional sudo unixodbc-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir uv==0.12.22 && uv venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV UV=1 UV_NO_PROGRESS=1 UV_LINK_MODE=copy PYTHONUNBUFFERED=1
+
+# Cache the dependencies used by Makefile's install-dev without baking candidate
+# source into the image. Every job installs its own exact checkout afterward.
+COPY pyproject.toml /tmp/pyproject.toml
+RUN uv pip install tomli && python -c \
+    'import tomli; p = tomli.load(open("/tmp/pyproject.toml", "rb"))["project"]; print("\n".join(p["dependencies"] + [d for extra in ("dev", "web", "slack", "dlt", "lsp") for d in p["optional-dependencies"][extra]]))' \
+    > /tmp/requirements.txt \
+    && uv pip install -r /tmp/requirements.txt && uv cache clean

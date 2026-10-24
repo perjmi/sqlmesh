@@ -44,7 +44,8 @@ metadata:
   name: sqlmesh-personal-runner
   namespace: ws-tryg360-next-development
 spec:
-  replicas: 1
+  # One job per pod: separate daemons and resource budgets for all three slots.
+  replicas: 3
   selector:
     matchLabels:
       app: sqlmesh-personal-runner
