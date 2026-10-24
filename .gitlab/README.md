@@ -34,20 +34,20 @@ coverage for GitLab configuration and shared frontend dependency files. Changes
 to GitLab CI run every portable suite. Manual and scheduled pipelines run all
 portable suites; `UPSTREAM_TEST_ALL=1` also forces them for an individual pipeline.
 All automatic jobs are required and run alongside `personal-regressions`.
-The network-dependent Spark and Trino jobs are manual until their registry is
-reachable. Set `UPSTREAM_TEST_NETWORK_ENGINES=1` to include them as required
+The network-dependent Spark, Trino, and DB2 jobs are manual until their registries
+are reachable. Set `UPSTREAM_TEST_NETWORK_ENGINES=1` to include them as required
 checks; `UPSTREAM_TEST_ALL=1` also includes them as required checks.
 New commits cancel superseded interruptible pipelines, as upstream does.
 
-A complete merge-request pipeline has 31 automatic required jobs and two manual
+A complete merge-request pipeline has 30 automatic required jobs and three manual
 network-dependent jobs by default, or 33 required jobs with the override above.
 Windows checks need a Windows
 runner and are outside this Linux cluster. Upstream's cloud-engine checks run
 only on `main`; they require separate test accounts and are not PR merge tests.
 Spark and Trino additionally need network access to `cgr.dev`, which supplies
-the upstream fixtures' pinned MinIO images. Their initial validation failed at
-this firewall boundary. Once enabled as required checks, infrastructure failures
-fail the pipeline just like test failures.
+the upstream fixtures' pinned MinIO images; DB2 needs IBM's `icr.io` registry.
+Their initial validation failed at these firewall boundaries. Once enabled as
+required checks, infrastructure failures fail the pipeline just like test failures.
 
 The upstream controller uses the job's Docker socket and network so database
 ports are available on localhost, as on GitHub's runners. Dependency images are

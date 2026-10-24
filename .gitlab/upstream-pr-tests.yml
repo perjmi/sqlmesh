@@ -87,6 +87,9 @@ upstream-db2:
     PYTHON_VERSION: "3.12"
     ENGINE: db2
   rules:
+    - if: '$UPSTREAM_TEST_NETWORK_ENGINES != "1" && $UPSTREAM_TEST_ALL != "1"'
+      when: manual
+      allow_failure: true
     - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $UPSTREAM_TEST_ALL == "1"'
     - changes:
         - sqlmesh/core/engine_adapter/db2.py
