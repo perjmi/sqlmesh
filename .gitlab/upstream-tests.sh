@@ -9,6 +9,18 @@ report_dir="$project_dir/test-results/upstream"
 export PATH="$project_dir/.gitlab/bin:$PATH"
 export PYTEST_REPORT_DIR="$report_dir"
 
+prepare_duckdb() {
+    # The cluster blocks extensions.duckdb.org. Matching PyPI wheels contain
+    # DuckDB's signed binaries; pin the supported engine version for repeatability.
+    duckdb_version=1.5.5
+    if [[ "$PYTHON_VERSION" == 3.9 ]]; then
+        duckdb_version=1.4.4
+    fi
+    uv pip install "duckdb==$duckdb_version" "duckdb-extension-httpfs==$duckdb_version" \
+        "duckdb-extension-tpch==$duckdb_version" "duckdb-extension-ducklake==$duckdb_version"
+    python .gitlab/prepare-duckdb-extensions.py
+}
+
 if [[ "$UPSTREAM_TEST_SUITE" == migrations ]]; then
     # The upstream migration script temporarily checks out a release tag. Restore
     # the candidate even on failure so artifacts retain the pipeline's checkout.
@@ -18,6 +30,7 @@ fi
 case "$UPSTREAM_TEST_SUITE" in
     python)
         make install-dev
+        prepare_duckdb
         make py-style
         if [[ "$PYTHON_VERSION" != 3.9 ]]; then
             make benchmark-ci
@@ -26,7 +39,7 @@ case "$UPSTREAM_TEST_SUITE" in
         ;;
     documentation)
         make install-dev install-doc
-        make doc-test
+        PYTEST_ADDOPTS="--junitxml=$report_dir/junit-documentation.xml" make doc-test
         ;;
     migrations)
         bash .github/scripts/test_migration.sh sushi '--gateway duckdb_persistent'
@@ -34,6 +47,9 @@ case "$UPSTREAM_TEST_SUITE" in
         ;;
     engine)
         make install-dev
+        if [[ "$ENGINE" == duckdb ]]; then
+            prepare_duckdb
+        fi
         if [[ "$ENGINE" == db2 ]]; then
             apt-get update && apt-get install -y --no-install-recommends libxml2-dev
         fi
@@ -46,6 +62,7 @@ case "$UPSTREAM_TEST_SUITE" in
         source .venv/bin/activate
         export PATH="$project_dir/.gitlab/bin:$PATH"
         make "install-dev-dbt-$DBT_VERSION"
+        prepare_duckdb
         case "$DBT_VERSION" in
             1.3|1.4|1.5)
                 schema_file=tests/fixtures/dbt/sushi_test/models/schema.yml

@@ -77,7 +77,7 @@ docker run --rm --name "$controller_name" --network host --shm-size=1g \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$project_dir:$project_dir" -w "$project_dir" \
     -e CI=true -e UPSTREAM_TEST_SUITE -e PYTHON_VERSION -e ENGINE -e DBT_VERSION \
-    -e SQLMESH__DISABLE_ANONYMIZED_ANALYTICS=1 \
+    -e DBT_SEND_ANONYMOUS_USAGE_STATS=false \
     -e PYTEST_XDIST_AUTO_NUM_WORKERS=2 -e SPARK_LOCAL_IP=127.0.0.1 \
     -e PYTHONDONTWRITEBYTECODE=1 \
     "$image" bash .gitlab/upstream-tests.sh

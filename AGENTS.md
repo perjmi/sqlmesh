@@ -68,6 +68,9 @@ Dependency images are cached in the project registry; each job installs the
 exact checkout before testing. Do not forward registry credentials to test
 controllers. The Docker network shared with each upstream controller belongs to
 that job's isolated daemon, so Compose localhost ports cannot collide across jobs.
+Upstream test controllers must not set `SQLMESH__` configuration variables,
+because configuration tests expect a clean environment. DuckDB extension wheels
+use a matching supported engine version and retain publisher signature checks.
 
 Authenticated Git and API access to both hosts has been verified in this
 workspace. GitHub uses the `gh` CLI; `gh api user` checks the active account and

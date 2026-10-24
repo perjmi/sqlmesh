@@ -39,6 +39,9 @@ New commits cancel superseded interruptible pipelines, as upstream does.
 A complete merge-request pipeline has 33 jobs. Windows checks need a Windows
 runner and are outside this Linux cluster. Upstream's cloud-engine checks run
 only on `main`; they require separate test accounts and are not PR merge tests.
+Spark and Trino additionally need network access to `cgr.dev`, which supplies
+the upstream fixtures' pinned MinIO images. A firewall block is an infrastructure
+failure and remains visible as a failed required job.
 
 The upstream controller uses the job's Docker socket and network so database
 ports are available on localhost, as on GitHub's runners. Dependency images are
@@ -56,6 +59,12 @@ personal harness from upstream's bare pytest commands; that harness runs in its
 own required job with separate images and fixtures. Browser jobs retain
 Playwright reports and failure traces, and engine jobs retain Compose logs.
 Migration jobs restore the candidate checkout on failure as well as success.
+Python, DuckDB, and dbt jobs pin DuckDB 1.5.5 (1.4.4 on Python 3.9) and cache its matching `httpfs`,
+`tpch`, and `ducklake` binaries from PyPI wheels, because the cluster blocks
+`extensions.duckdb.org`. DuckDB verifies publisher signatures when loading them;
+the wheels' Python modules are not imported. Framework and test sources remain
+the candidate's originals. Pytest stops at the first failed test to expose
+diagnostics promptly; successful runs still execute every selected test.
 The mypy wrapper likewise limits upstream's strict type checks to its original
 tree; Ruff and formatting still cover the personal harness. Its standalone
 imports and historical benchmark scripts use a separate testing environment.

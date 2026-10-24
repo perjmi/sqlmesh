@@ -3,7 +3,7 @@
 set -eu
 # The original upstream tree has no personal harness. It has its own required
 # job, dependencies, image builds, and fixtures, and must not enter this suite.
-set -- "$@" --ignore=examples/randomgraphs
+set -- "$@" --ignore=examples/randomgraphs --maxfail=1 --tb=short -o faulthandler_timeout=120
 # Upstream's Makefile gives only the main process a JUnit path. Preserve it and
 # also report each isolated pytest invocation without overwriting earlier suites.
 for arg in "$@"; do
