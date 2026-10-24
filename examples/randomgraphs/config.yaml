@@ -14,3 +14,5 @@ default_gateway: postgres
 cache_dir: {{ env_var('SQLMESH_CACHE_DIR', '.cache') }}
 model_defaults:
   dialect: postgres
+  # Keep historical execution-time fixtures independent of the date CI runs.
+  start: '2026-08-01'

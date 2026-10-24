@@ -71,5 +71,5 @@ docker run --rm --name "$controller_name" \
     -e "RANDOMGRAPHS_ACCURACY_TIER=${RANDOMGRAPHS_ACCURACY_TIER:-pr}" \
     -e "RANDOMGRAPHS_MUTATION_TIER=${RANDOMGRAPHS_MUTATION_TIER:-pr}" \
     -e PYTHONDONTWRITEBYTECODE=1 \
-    "$controller_image" python -m pytest -c pytest.ini \
+    "$controller_image" python -u -m pytest -c pytest.ini -vv \
     tests --junitxml="$report_dir/junit.xml"

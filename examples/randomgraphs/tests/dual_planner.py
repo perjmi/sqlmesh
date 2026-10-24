@@ -156,10 +156,14 @@ def database_signature(
         """
         for model_name in model_names
     ]
+    # Parallel Append can reorder UNION ALL results. Each row contains its model
+    # name, so sort complete records while retaining every aggregate value.
     digests = tuple(
-        row
-        for start in range(0, len(digest_queries), 100)
-        for row in query(target, " UNION ALL ".join(digest_queries[start : start + 100]))
+        sorted(
+            row
+            for start in range(0, len(digest_queries), 100)
+            for row in query(target, " UNION ALL ".join(digest_queries[start : start + 100]))
+        )
     )
     materialized_view_count = query(
         target,

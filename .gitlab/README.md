@@ -17,6 +17,11 @@ random graph suites use the `pr` tier by default. Override
 scheduled run. `REFERENCE_SQLMESH_SHA` pins a chosen upstream reference; otherwise
 the job fetches upstream `main` once and records the resolved SHA.
 
+The job streams each test result as it completes. The harness sets a historical
+model start date so its fixed execution-time scenarios remain valid on later CI
+runs. Aggregate comparisons sort complete records to account for PostgreSQL's
+unordered `UNION ALL` output while still comparing every value.
+
 ## Kubernetes runner
 
 The project-specific runner has tag `sqlmesh-personal-k8s` and runs in namespace
