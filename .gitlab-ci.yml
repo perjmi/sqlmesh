@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_BRANCH == "personal-tests" && $CI_PIPELINE_SOURCE == "push"'
+
+stages:
+  - regression
+
+personal-regressions:
+  stage: regression
+  image: mirror.gcr.io/library/docker:27.5.1-cli
+  tags:
+    - sqlmesh-personal-k8s
+  services:
+    - name: mirror.gcr.io/library/docker:27.5.1-dind
+      alias: docker
+      command: ["--tls=false", "--registry-mirror=https://mirror.gcr.io"]
+  variables:
+    DOCKER_HOST: tcp://localhost:2375
+    DOCKER_TLS_CERTDIR: ""
+    HEALTHCHECK_TCP_PORT: "2375"
+    GIT_DEPTH: "0"
+    RANDOMGRAPHS_ACCURACY_TIER: pr
+    RANDOMGRAPHS_MUTATION_TIER: pr
+  timeout: 2h
+  interruptible: true
+  script:
+    - sh .gitlab/run-personal-tests.sh
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - test-results/personal/
+    reports:
+      junit: test-results/personal/junit.xml

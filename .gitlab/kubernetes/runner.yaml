@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sqlmesh-personal-tests
+  namespace: ws-tryg360-next-development
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sqlmesh-personal-runner
+  namespace: ws-tryg360-next-development
+data:
+  config.toml: |
+    concurrent = 1
+    check_interval = 3
+    shutdown_timeout = 30
+
+    [[runners]]
+      name = "sqlmesh-personal-k8s"
+      url = "https://gitlab.devops.prdroot.net"
+      token = "__RUNNER_TOKEN__"
+      executor = "kubernetes"
+      builds_dir = "/builds"
+      output_limit = 16384
+      [runners.kubernetes]
+        namespace = "ws-tryg360-next-development"
+        service_account = "sqlmesh-personal-tests"
+        automount_service_account_token = false
+        image = "mirror.gcr.io/library/docker:27.5.1-cli"
+        privileged = false
+        allowed_images = ["mirror.gcr.io/library/docker:27.5.1-cli"]
+        allowed_services = ["mirror.gcr.io/library/docker:27.5.1-dind"]
+        poll_timeout = 600
+        cpu_request = "200m"
+        cpu_limit = "2"
+        memory_request = "256Mi"
+        memory_limit = "1Gi"
+        helper_cpu_request = "100m"
+        helper_cpu_limit = "1"
+        helper_memory_request = "128Mi"
+        helper_memory_limit = "512Mi"
+        service_cpu_request = "2"
+        service_cpu_limit = "8"
+        service_memory_request = "4Gi"
+        service_memory_limit = "16Gi"
+        service_ephemeral_storage_request = "2Gi"
+        service_ephemeral_storage_limit = "40Gi"
+        [runners.kubernetes.service_container_security_context]
+          privileged = true
+        [[runners.kubernetes.volumes.empty_dir]]
+          name = "docker-storage"
+          mount_path = "/var/lib/docker"
+          size_limit = "40Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sqlmesh-personal-runner
+  namespace: ws-tryg360-next-development
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sqlmesh-personal-runner
+  template:
+    metadata:
+      labels:
+        app: sqlmesh-personal-runner
+    spec:
+      # The workspace account already has namespaced pod management permissions.
+      # Test job pods use the separate account above with no mounted API token.
+      serviceAccountName: ws-tryg360-next-development
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: runner
+          image: mirror.gcr.io/gitlab/gitlab-runner:alpine-v19.2.0
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              umask 077
+              mkdir -p /runner-config
+              awk 'BEGIN {getline token < "/runner-secret/token"} {gsub(/__RUNNER_TOKEN__/, token); print}' \
+                /runner-template/config.toml > /runner-config/config.toml
+              exec gitlab-runner run --config /runner-config/config.toml --working-directory /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: template
+              mountPath: /runner-template
+              readOnly: true
+            - name: secret
+              mountPath: /runner-secret
+              readOnly: true
+            - name: config
+              mountPath: /runner-config
+      volumes:
+        - name: template
+          configMap:
+            name: sqlmesh-personal-runner
+        - name: secret
+          secret:
+            secretName: sqlmesh-personal-runner
+        - name: config
+          emptyDir: {}

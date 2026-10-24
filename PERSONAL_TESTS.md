@@ -78,6 +78,12 @@ branch. Avoid rebasing or force-pushing this shared, permanent branch.
 
 ## Fast local checks
 
+GitLab merge requests targeting `personal-tests` also run the complete harness
+in the Kubernetes cluster through `.gitlab-ci.yml`. The project uses merged-result
+pipelines and requires a successful pipeline before merging. See
+[.gitlab/README.md](.gitlab/README.md) for runner provisioning, reports, and testing
+rebased GitHub contributions. The default CI accuracy and mutation tiers are `pr`.
+
 Use Python 3.10 or newer for the harness and an isolated environment:
 
 ```bash
